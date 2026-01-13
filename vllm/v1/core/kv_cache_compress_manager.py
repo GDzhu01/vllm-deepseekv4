@@ -91,7 +91,7 @@ class KVCacheBlocks:
         return KVCacheBlocks(tuple(() for _ in range(len(self.blocks))))
 
 
-class KVCacheManager:
+class KVCacheCompressManager:
     def __init__(
         self,
         kv_cache_config: KVCacheConfig,
@@ -147,7 +147,10 @@ class KVCacheManager:
         Returns:
             The KV cache usage (between 0.0 and 1.0).
         """
-        return self.block_pool.get_usage()
+        block_pool_usage = 0
+        for block_pool in self.block_pool:
+            block_pool_usage += block_pool.get_usage()
+        return block_pool_usage / 2
 
     def make_prefix_cache_stats(self) -> PrefixCacheStats | None:
         """Get (and reset) the prefix cache stats.
@@ -155,6 +158,7 @@ class KVCacheManager:
         Returns:
             The current prefix caching stats, or None if logging is disabled.
         """
+        # TODO(lxs)
         if not self.log_stats:
             return None
         stats = self.prefix_cache_stats
@@ -277,24 +281,26 @@ class KVCacheManager:
             self.max_model_len,
         )
 
-        num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+        num_blocks_to_allocate_list = self.coordinator.get_num_blocks_to_allocate(
             request_id=request.request_id,
             num_tokens=num_tokens_need_slot,
             new_computed_blocks=new_computed_block_list,
             num_encoder_tokens=num_encoder_tokens,
         )
 
-        if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
-            # Cannot allocate new blocks
-            return None
+        for num_blocks_to_allocate, block_pool in zip(num_blocks_to_allocate_list, self.block_pools):
+            if num_blocks_to_allocate > block_pool.get_num_free_blocks():
+                # Cannot allocate new blocks
+                return None
 
         # Touch the computed blocks to make sure they won't be evicted.
         if self.enable_caching:
-            self.block_pool.touch(new_computed_block_list)
+            [block_pool.touch(new_computed_block_list) for block_pool in self.block_pools]
         else:
-            assert not any(new_computed_block_list), (
-                "Computed blocks should be empty when prefix caching is disabled"
-            )
+            for new_computed_block_l in new_computed_block_list:
+                assert not any(new_computed_block_l), (
+                    "Computed blocks should be empty when prefix caching is disabled"
+                )
 
         if new_computed_block_list is not self.empty_kv_cache_blocks.blocks:
             # Append the new computed blocks to the request blocks until now to
@@ -333,13 +339,13 @@ class KVCacheManager:
         """
         self.coordinator.free(request.request_id)
 
-    def evict_blocks(self, block_ids: set[int]) -> None:
+    def evict_blocks(self, block_ids_list: tuple(set[int])) -> None:
         """evict blocks from the prefix cache by their block IDs.
 
         Args:
             block_ids: Set of block IDs to evict from cache.
         """
-        self.block_pool.evict_blocks(block_ids)
+        [block_pool.evict_blocks(block_ids) for block_pool, block_ids in zip(self.block_pools, block_ids_list)]
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
@@ -350,6 +356,7 @@ class KVCacheManager:
             bool: True if the prefix cache is successfully reset,
             False otherwise.
         """
+        # TODO（lxs）: fix me when prefix cache
         if not self.block_pool.reset_prefix_cache():
             return False
         if self.log_stats:
@@ -389,15 +396,16 @@ class KVCacheManager:
             list[int]: The number of common prefix blocks for each kv cache
             group.
         """
+        # TODO（lxs）: fix me when prefix cache
         return self.coordinator.get_num_common_prefix_blocks(running_request_id)
 
-    def take_events(self) -> list[KVCacheEvent]:
+    def take_events(self) -> tuple(list[KVCacheEvent]):
         """Take the KV cache events from the block pool.
 
         Returns:
             A list of KV cache events.
         """
-        return self.block_pool.take_events()
+        return tuple([block_pool.take_events() for block_pool in self.block_pools])
 
     def get_blocks(self, request_id: str) -> KVCacheBlocks:
         """Get the blocks of a request."""
