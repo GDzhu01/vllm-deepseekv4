@@ -440,6 +440,7 @@ class GPUModelRunner(
             vocab_size=self.model_config.get_vocab_size(),
             block_sizes=[self.cache_config.block_size],
             kernel_block_sizes=[self.cache_config.block_size],
+            compress_ratio = [1],
             is_spec_decode=bool(self.vllm_config.speculative_config),
             logitsprocs=build_logitsprocs(
                 self.vllm_config,
@@ -956,7 +957,8 @@ class GPUModelRunner(
             # Update the persistent batch.
             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
             if new_block_ids is not None:
-                self.input_batch.block_table.append_row(new_block_ids, req_index)
+
+                self.input_batch.block_table.append_row(new_block_ids, req_index, num_new_tokens)
 
             # For the last rank, we don't need to update the token_ids_cpu
             # because the sampled tokens are already cached.

@@ -16,6 +16,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowSpec,
+    CompressAttentionSpec,
 )
 from vllm.v1.request import Request
 
@@ -783,6 +784,12 @@ class CrossAttentionManager(SingleTypeKVCacheManager):
         raise NotImplementedError("CrossAttentionManager does not support caching")
 
 
+class CompressAttentionManager(SingleTypeKVCacheManager):
+    def get_num_common_prefix_blocks():
+        ...
+    def find_longest_cache_hit():
+        ...
+
 spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
     FullAttentionSpec: FullAttentionManager,
     MLAAttentionSpec: FullAttentionManager,
@@ -790,6 +797,7 @@ spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
     ChunkedLocalAttentionSpec: ChunkedLocalAttentionManager,
     MambaSpec: MambaManager,
     CrossAttentionSpec: CrossAttentionManager,
+    CompressAttentionSpec: CompressAttentionManager,
 }
 
 

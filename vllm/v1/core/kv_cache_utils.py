@@ -1087,7 +1087,7 @@ def get_kv_cache_config_from_groups(
         num_blocks = (
             available_memory // kv_cache_groups[0].kv_cache_spec.page_size_bytes
         )
-        num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+        num_blocks = may_override_num_blocks(vllm_config, num_blocks)  # num_blocks 统一
         per_layer_specs = kv_cache_groups[0].kv_cache_spec.kv_cache_specs
         kv_cache_tensors = [
             KVCacheTensor(

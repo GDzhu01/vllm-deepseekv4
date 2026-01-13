@@ -130,7 +130,7 @@ class EngineCore:
             vllm_config.cache_config.block_size
             * vllm_config.parallel_config.decode_context_parallel_size
             * vllm_config.parallel_config.prefill_context_parallel_size
-        )
+        )  # scheduler 看到的 blcok_size 和 kvcache manager 一样，是 128
 
         self.scheduler: SchedulerInterface = Scheduler(
             vllm_config=vllm_config,
@@ -249,7 +249,7 @@ class EngineCore:
             vllm_config, kv_cache_specs, available_gpu_memory
         )
         scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
-        num_gpu_blocks = scheduler_kv_cache_config.num_blocks
+        num_gpu_blocks = scheduler_kv_cache_config.num_blocks  # block_num 一致
         num_cpu_blocks = 0
 
         # Initialize kv cache and warmup the execution

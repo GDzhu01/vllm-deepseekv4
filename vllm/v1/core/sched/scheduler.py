@@ -207,7 +207,7 @@ class Scheduler(SchedulerInterface):
             enable_kv_cache_events=self.enable_kv_cache_events,
             dcp_world_size=self.dcp_world_size,
             pcp_world_size=self.pcp_world_size,
-            hash_block_size=self.block_size,
+            hash_block_size=self.block_size,  # 128
             metrics_collector=self.kv_metrics_collector,
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
@@ -244,6 +244,9 @@ class Scheduler(SchedulerInterface):
 
         # First, schedule the RUNNING requests.
         req_index = 0
+
+        # state_manager 要返回是否把完全压缩后的 kv 填回 compress kv 的信号。
+        # 调用一次 allocate_new_blocks
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
 

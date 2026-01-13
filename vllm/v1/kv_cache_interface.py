@@ -157,6 +157,35 @@ class FullAttentionSpec(AttentionSpec):
         )
         return merged_spec
 
+@dataclass(frozen=True)
+class CompressAttentionSpec(AttentionSpec):
+    compress_ratio: int = 1
+    indexer_head_size: int = 0
+
+    @property
+    def page_size_bytes(self) -> int:
+        """
+        The size of a page with `block_size` tokens in bytes.
+
+        Returns:
+            The page size
+        """
+        base_page_size = self.block_size * self.head_size * 1 * get_dtype_size(self.dtype)
+        indexer_page_size = self.block_size * self.indexer_head_size * get_dtype_size(self.dtype)
+        page_size = (base_page_size + indexer_page_size) // self.compress_ratio
+
+        return page_size
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        """
+        The maximum possible memory usage of this KV cache in bytes.
+
+        Returns:
+            The KV cache size in bytes
+        """
+        # TODO: implement me
+        return 1
+
 
 @dataclass(frozen=True)
 class MLAAttentionSpec(FullAttentionSpec):
