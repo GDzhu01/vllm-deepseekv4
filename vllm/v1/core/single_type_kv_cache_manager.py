@@ -785,11 +785,37 @@ class CrossAttentionManager(SingleTypeKVCacheManager):
 
 
 class CompressAttentionManager(SingleTypeKVCacheManager):
-    # TODO(cmq): adapt me. at least skip the prefix cache
-    def get_num_common_prefix_blocks():
-        ...
-    def find_longest_cache_hit():
-        ...
+
+    @classmethod
+    def find_longest_cache_hit(
+        cls,
+        block_hashes: BlockHashList,
+        max_length: int,
+        kv_cache_group_ids: list[int],
+        block_pool: BlockPool,
+        kv_cache_spec: KVCacheSpec,
+        use_eagle: bool,
+        alignment_tokens: int,
+        dcp_world_size: int = 1,
+        pcp_world_size: int = 1,
+    ) -> tuple[list[KVCacheBlock], ...]:
+        assert isinstance(kv_cache_spec, CompressAttentionManager), (
+            "CompressAttentionManager can only be used for dsv4"
+        )
+        assert dcp_world_size == 1, "DCP not support mamba now."
+        assert pcp_world_size == 1, "PCP not support mamba now."
+        computed_blocks: tuple[list[KVCacheBlock], ...] = tuple(
+            [] for _ in range(len(kv_cache_group_ids))
+        )
+
+        return computed_blocks
+
+    def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
+        """
+        cascade attention is not supported by mamba
+        """
+        return 0
+
 
 spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
     FullAttentionSpec: FullAttentionManager,

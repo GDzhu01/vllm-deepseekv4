@@ -171,8 +171,10 @@ class CompressAttentionSpec(AttentionSpec):
         Returns:
             The page size
         """
+        if self.compress_ratio == 1:
+            return 0
         base_page_size = self.block_size * self.head_size * 1 * get_dtype_size(self.dtype)
-        indexer_page_size = self.block_size * self.indexer_head_size * get_dtype_size(self.dtype)
+        indexer_page_size = self.block_size * self.indexer_head_size * 1 * get_dtype_size(self.dtype)
         page_size = (base_page_size + indexer_page_size) // self.compress_ratio
 
         return page_size
@@ -184,8 +186,8 @@ class CompressAttentionSpec(AttentionSpec):
         Returns:
             The KV cache size in bytes
         """
-        # TODO: implement me
-        return 1
+        max_model_len = vllm_config.model_config.max_model_len
+        return cdiv(max_model_len, self.block_size) * self.page_size_bytes
 
 
 @dataclass(frozen=True)
