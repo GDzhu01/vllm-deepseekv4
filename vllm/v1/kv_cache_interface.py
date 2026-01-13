@@ -192,6 +192,72 @@ class CompressAttentionSpec(AttentionSpec):
 
 
 @dataclass(frozen=True)
+class Compress4AttentionSpec(CompressAttentionSpec):
+    # TODO(cmq): adapt the logic of quantization
+    compress_ratio: int = 1
+    indexer_head_size: int = 0
+
+    @property
+    def page_size_bytes(self) -> int:
+        """
+        The size of a page with `block_size` tokens in bytes.
+
+        Returns:
+            The page size
+        """
+        if self.compress_ratio == 1:
+            return 0
+        base_page_size = self.block_size * self.head_size * 1 * get_dtype_size(self.dtype)
+        indexer_page_size = self.block_size * self.indexer_head_size * 1 * get_dtype_size(self.dtype)
+        page_size = (base_page_size + indexer_page_size) // self.compress_ratio
+
+        return page_size
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        """
+        The maximum possible memory usage of this KV cache in bytes.
+
+        Returns:
+            The KV cache size in bytes
+        """
+        max_model_len = vllm_config.model_config.max_model_len
+        return cdiv(max_model_len, self.block_size) * self.page_size_bytes
+
+
+@dataclass(frozen=True)
+class Compress128AttentionSpec(CompressAttentionSpec):
+    # TODO(cmq): adapt the logic of quantization
+    compress_ratio: int = 128
+    indexer_head_size: int = 0
+
+    @property
+    def page_size_bytes(self) -> int:
+        """
+        The size of a page with `block_size` tokens in bytes.
+
+        Returns:
+            The page size
+        """
+        if self.compress_ratio == 1:
+            return 0
+        base_page_size = self.block_size * self.head_size * 1 * get_dtype_size(self.dtype)
+        indexer_page_size = self.block_size * self.indexer_head_size * 1 * get_dtype_size(self.dtype)
+        page_size = (base_page_size + indexer_page_size) // self.compress_ratio
+
+        return page_size
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        """
+        The maximum possible memory usage of this KV cache in bytes.
+
+        Returns:
+            The KV cache size in bytes
+        """
+        max_model_len = vllm_config.model_config.max_model_len
+        return cdiv(max_model_len, self.block_size) * self.page_size_bytes
+
+
+@dataclass(frozen=True)
 class MLAAttentionSpec(FullAttentionSpec):
     # TODO(Lucas/Chen): less hacky way to do this
     cache_dtype_str: str | None = None
