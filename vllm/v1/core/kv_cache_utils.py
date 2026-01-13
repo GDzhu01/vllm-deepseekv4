@@ -830,6 +830,12 @@ def get_num_blocks(
     return num_blocks
 
 
+def check_uniform_page_size(kv_cache_groups: list[KVCacheGroupSpec]) -> bool:
+    kv_cache_specs = [group.kv_cache_spec for group in kv_cache_groups]
+    page_sizes = {layer.page_size_bytes for layer in kv_cache_specs}
+    return len(page_sizes) == 1
+
+
 def get_uniform_page_size(kv_cache_specs: Iterable[KVCacheSpec]) -> int:
     """
     Get the page size of the KV cache.
@@ -1052,6 +1058,30 @@ def _get_kv_cache_groups_uniform_page_size(
     return create_kv_cache_group_specs(kv_cache_spec, grouped_layers)
 
 
+def _get_kv_cache_groups_uniform_block_size(
+        kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec]:
+    '''
+    Generates the KV cache groups with same block size,
+    and there maybe multiple groups with different spec,
+    each group has their own block_pool and each layer
+    of each group has their own kv_cache_tensor.
+
+    :param kv_cache_spec: Description
+    :type kv_cache_spec: dict[str, KVCacheSpec]
+    :return: Description
+    :rtype: list[KVCacheGroupSpec]
+    '''
+    same_type_layers: dict[KVCacheSpec, list[str]] = defaultdict(list)
+    _, first_kv_cache_config = next(iter(kv_cache_spec.items()))
+    block_size = first_kv_cache_config.block_size
+    for layer_name, layer_spec in kv_cache_spec.items():
+        assert block_size == layer_spec.block_size, "Layer block size is not equal."
+        same_type_layers[layer_spec].append(layer_name)
+    grouped_layers = list(same_type_layers.values())
+    return create_kv_cache_group_specs(kv_cache_spec, grouped_layers)
+
+
 def get_kv_cache_config_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1087,7 +1117,7 @@ def get_kv_cache_config_from_groups(
         num_blocks = (
             available_memory // kv_cache_groups[0].kv_cache_spec.page_size_bytes
         )
-        num_blocks = may_override_num_blocks(vllm_config, num_blocks)  # num_blocks 统一
+        num_blocks = may_override_num_blocks(vllm_config, num_blocks)
         per_layer_specs = kv_cache_groups[0].kv_cache_spec.kv_cache_specs
         kv_cache_tensors = [
             KVCacheTensor(
@@ -1096,6 +1126,15 @@ def get_kv_cache_config_from_groups(
             )
             for layer_name in kv_cache_groups[0].layer_names
         ]
+    elif check_uniform_page_size(kv_cache_groups) is False:
+        # kv cache spec with multiple groups and same block size, but don't share
+        total_page_size_bytes = 0
+        for kv_cache_group in kv_cache_groups:
+            num_layers = len(kv_cache_group.layer_names)
+            page_size = kv_cache_group.kv_cache_spec.page_size_bytes
+            total_page_size_bytes += page_size * num_layers
+        num_blocks = available_memory // total_page_size_bytes
+        assert num_blocks > 0
     else:
         # General case:
         # We will have group_size memory pools, each is shared by one layer from
@@ -1204,6 +1243,10 @@ def get_kv_cache_groups(
     Returns:
         The generated KVCacheGroups
     """
+    if vllm_config.is_dsv4:
+        # kv cache group spec with multi groups and same block size without share hybrid blocks
+        return _get_kv_cache_groups_uniform_block_size(kv_cache_spec)
+
     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
         unify_hybrid_kv_cache_specs(kv_cache_spec)
 
