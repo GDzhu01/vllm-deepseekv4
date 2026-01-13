@@ -159,6 +159,7 @@ class FullAttentionSpec(AttentionSpec):
 
 @dataclass(frozen=True)
 class CompressAttentionSpec(AttentionSpec):
+    # TODO(cmq): adapt the logic of quantization
     compress_ratio: int = 1
     indexer_head_size: int = 0
 

@@ -785,6 +785,7 @@ class CrossAttentionManager(SingleTypeKVCacheManager):
 
 
 class CompressAttentionManager(SingleTypeKVCacheManager):
+    # TODO(cmq): adapt me. at least skip the prefix cache
     def get_num_common_prefix_blocks():
         ...
     def find_longest_cache_hit():

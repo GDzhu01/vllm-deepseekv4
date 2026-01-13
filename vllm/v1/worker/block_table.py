@@ -212,7 +212,7 @@ class BlockTable:
             block_offsets = positions % self.block_size
             # block_offsets: [0,0, 1,1, 0,0, 1,1]
             # 压缩完后的 slot mapping 要去重
-            # TODO: 
+            # TODO(cmq): 把这边的逻辑都搬到 vllm-ascend 的 blocktable 去
             # 1. 不满压缩比的时候，给 state_manager 放
             # 2. state_manager 那边放满的时候，给 compress kv 放
             # 3. overlap 要考虑

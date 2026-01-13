@@ -245,7 +245,7 @@ class Scheduler(SchedulerInterface):
         # First, schedule the RUNNING requests.
         req_index = 0
 
-        # state_manager 要返回是否把完全压缩后的 kv 填回 compress kv 的信号。
+        # TODO(cmq): state_manager 要返回是否把完全压缩后的 kv 填回 compress kv 的信号。
         # 调用一次 allocate_new_blocks
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]

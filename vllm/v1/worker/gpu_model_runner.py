@@ -957,7 +957,7 @@ class GPUModelRunner(
             # Update the persistent batch.
             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
             if new_block_ids is not None:
-
+                # TODO(cmq): move the whole update_states logic to vllm-ascend
                 self.input_batch.block_table.append_row(new_block_ids, req_index, num_new_tokens)
 
             # For the last rank, we don't need to update the token_ids_cpu
