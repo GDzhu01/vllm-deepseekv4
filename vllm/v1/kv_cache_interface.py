@@ -157,6 +157,39 @@ class FullAttentionSpec(AttentionSpec):
         )
         return merged_spec
 
+@dataclass(frozen=True)
+class CompressAttentionSpec(AttentionSpec):
+    # TODO(cmq): adapt the logic of quantization
+    compress_ratio: int = 1
+    indexer_head_size: int = 0
+    min_mem_usage: int = 128 # avoid 0 // 0
+
+    @property
+    def page_size_bytes(self) -> int:
+        """
+        The size of a page with `block_size` tokens in bytes.
+
+        Returns:
+            The page size
+        """
+        if self.compress_ratio == 1:
+            return self.min_mem_usage
+        base_page_size = self.block_size * self.head_size * 1 * get_dtype_size(self.dtype)
+        indexer_page_size = self.block_size * self.indexer_head_size * 1 * get_dtype_size(self.dtype)
+        page_size = (base_page_size + indexer_page_size) // self.compress_ratio
+
+        return max(page_size, self.min_mem_usage)
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        """
+        The maximum possible memory usage of this KV cache in bytes.
+
+        Returns:
+            The KV cache size in bytes
+        """
+        max_model_len = vllm_config.model_config.max_model_len
+        return cdiv(max_model_len, self.block_size) * self.page_size_bytes
+
 
 @dataclass(frozen=True)
 class MLAAttentionSpec(FullAttentionSpec):
@@ -340,6 +373,11 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
             return all(
                 isinstance(spec, MambaSpec)
                 and spec.num_speculative_blocks == one_spec.num_speculative_blocks
+                for spec in kv_cache_specs.values()
+            )
+        elif isinstance(one_spec, CompressAttentionSpec):
+            return all(
+                isinstance(spec, CompressAttentionSpec)
                 for spec in kv_cache_specs.values()
             )
         else:

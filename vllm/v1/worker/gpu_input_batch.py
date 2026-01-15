@@ -91,6 +91,7 @@ class InputBatch:
         vocab_size: int,
         block_sizes: list[int],  # The block_size of each kv cache group
         kernel_block_sizes: list[int],
+        compress_ratios: list[int],
         logitsprocs: LogitsProcessors | None = None,
         logitsprocs_need_output_token_ids: bool = False,
         is_spec_decode: bool = False,
@@ -149,6 +150,7 @@ class InputBatch:
             device=device,
             block_sizes=block_sizes,
             kernel_block_sizes=kernel_block_sizes,
+            compress_ratios=compress_ratios,
             num_speculative_tokens=num_speculative_tokens,
             cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
         )
@@ -348,7 +350,7 @@ class InputBatch:
         self.num_tokens_no_spec[req_index] = request.num_tokens
 
         self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens
-        self.block_table.add_row(request.block_ids, req_index)
+        self.block_table.add_row(request.block_ids, req_index, request.num_tokens)
 
         if sampling_params := request.sampling_params:
             if self.is_spec_decode and is_spec_decode_unsupported(sampling_params):
