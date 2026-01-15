@@ -1134,7 +1134,16 @@ def get_kv_cache_config_from_groups(
             page_size = kv_cache_group.kv_cache_spec.page_size_bytes
             total_page_size_bytes += page_size * num_layers
         num_blocks = available_memory // total_page_size_bytes
+        # TODO(zxr): use compress ratio to replace magic num
+        num_blocks = num_blocks // 128 * 128
         assert num_blocks > 0
+        kv_cache_tensors = []
+        for i in range(len(kv_cache_groups)):
+            for layer_name in kv_cache_groups[i].layer_names:
+                shared_by = [layer_name]
+                kv_cache_tensors.append(
+                    KVCacheTensor(size=kv_cache_groups[i].kv_cache_spec.page_size_bytes * num_blocks, shared_by=shared_by)
+                )
     else:
         # General case:
         # We will have group_size memory pools, each is shared by one layer from
@@ -1243,7 +1252,8 @@ def get_kv_cache_groups(
     Returns:
         The generated KVCacheGroups
     """
-    if vllm_config.is_dsv4:
+    is_dsv4 = True
+    if is_dsv4:
         # kv cache group spec with multi groups and same block size without share hybrid blocks
         return _get_kv_cache_groups_uniform_block_size(kv_cache_spec)
 
@@ -1440,6 +1450,7 @@ def get_kv_cache_configs(
         if len(kv_cache_config.kv_cache_groups) > 0:
             _report_kv_cache_config(vllm_config, kv_cache_config)
 
+    print(30*"=", f"kv_cache_configs= {kv_cache_configs}")
     return kv_cache_configs
 
 

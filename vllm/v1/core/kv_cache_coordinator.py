@@ -547,6 +547,10 @@ class CompressKVCacheCoordinator(KVCacheCoordinator):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
         self.enable_caching = enable_caching
+        self.kv_cache_spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
+        self.block_size = self.kv_cache_spec.block_size
+        self.dcp_world_size = dcp_world_size
+        self.pcp_world_size = pcp_world_size
 
         # Needs special handling for find_longest_cache_hit if eagle is enabled
         self.use_eagle = use_eagle
@@ -582,7 +586,7 @@ class CompressKVCacheCoordinator(KVCacheCoordinator):
             block_hashes=block_hashes,
             max_length=max_cache_hit_length,
             kv_cache_group_ids=[0],
-            block_pool=self.block_pool,
+            block_pool=self.block_pools,
             kv_cache_spec=self.kv_cache_spec,
             use_eagle=self.use_eagle,
             alignment_tokens=self.block_size,
@@ -632,7 +636,8 @@ def get_kv_cache_coordinator(
     hash_block_size: int,
     metrics_collector: KVCacheMetricsCollector | None = None,
 ) -> KVCacheCoordinator:
-    if iscompress: # TODO(lxs) : need to remove
+    is_dsv4 = True
+    if is_dsv4: # TODO(lxs) : need to remove
         return CompressKVCacheCoordinator(
             kv_cache_config,
             max_model_len,
