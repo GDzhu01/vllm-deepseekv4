@@ -162,7 +162,6 @@ class CompressAttentionSpec(AttentionSpec):
     # TODO(cmq): adapt the logic of quantization
     compress_ratio: int = 1
     indexer_head_size: int = 0
-    min_mem_usage: int = 128 # avoid 0 // 0
 
     @property
     def page_size_bytes(self) -> int:
@@ -172,13 +171,11 @@ class CompressAttentionSpec(AttentionSpec):
         Returns:
             The page size
         """
-        if self.compress_ratio == 1:
-            return self.min_mem_usage
         base_page_size = self.block_size * self.head_size * 1 * get_dtype_size(self.dtype)
         indexer_page_size = self.block_size * self.indexer_head_size * 1 * get_dtype_size(self.dtype)
         page_size = (base_page_size + indexer_page_size) // self.compress_ratio
 
-        return max(page_size, self.min_mem_usage)
+        return page_size
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         """
@@ -205,8 +202,6 @@ class Compress4AttentionSpec(CompressAttentionSpec):
         Returns:
             The page size
         """
-        if self.compress_ratio == 1:
-            return 0
         base_page_size = self.block_size * self.head_size * 1 * get_dtype_size(self.dtype)
         indexer_page_size = self.block_size * self.indexer_head_size * 1 * get_dtype_size(self.dtype)
         page_size = (base_page_size + indexer_page_size) // self.compress_ratio
@@ -238,8 +233,6 @@ class Compress128AttentionSpec(CompressAttentionSpec):
         Returns:
             The page size
         """
-        if self.compress_ratio == 1:
-            return 0
         base_page_size = self.block_size * self.head_size * 1 * get_dtype_size(self.dtype)
         indexer_page_size = self.block_size * self.indexer_head_size * 1 * get_dtype_size(self.dtype)
         page_size = (base_page_size + indexer_page_size) // self.compress_ratio

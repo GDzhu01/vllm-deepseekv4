@@ -1108,8 +1108,11 @@ class ModelConfig:
             "longcat_flash",
             "pangu_ultra_moe",
             "pangu_ultra_moe_mtp",
+            "deepseek_v4"
         ):
-            return self.hf_text_config.kv_lora_rank is not None
+            # TODO(cmq): refactor me
+            return True
+            # return self.hf_text_config.kv_lora_rank is not None
         elif self.hf_text_config.model_type == "eagle":
             # if the model is an EAGLE module, check for the
             # underlying architecture
@@ -1138,7 +1141,9 @@ class ModelConfig:
         if self.is_deepseek_mla:
             qk_rope_head_dim = getattr(self.hf_text_config, "qk_rope_head_dim", 0)
             if self.use_mla:
-                return self.hf_text_config.kv_lora_rank + qk_rope_head_dim
+                # TODO(cmq): refactor me
+                return self.hf_text_config.head_dim
+                # return self.hf_text_config.kv_lora_rank + qk_rope_head_dim
             else:
                 qk_nope_head_dim = getattr(self.hf_text_config, "qk_nope_head_dim", 0)
                 if qk_rope_head_dim and qk_nope_head_dim:
