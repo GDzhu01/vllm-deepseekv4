@@ -22,7 +22,6 @@ class BlockTable:
         pin_memory: bool,
         device: torch.device,
         kernel_block_size: int,
-        compress_ratio: int,
         cp_kv_cache_interleave_size: int,
     ):
         """
@@ -64,8 +63,6 @@ class BlockTable:
             self.use_hybrid_blocks = True
 
         self.max_num_blocks_per_req = max_num_blocks_per_req * self.blocks_per_kv_block
-        self.compress_ratio = compress_ratio
-        self.block_size = block_size // compress_ratio
 
         self.block_table = self._make_buffer(
             self.max_num_reqs, self.max_num_blocks_per_req, dtype=torch.int32
@@ -103,20 +100,9 @@ class BlockTable:
         self,
         block_ids: list[int],
         row_idx: int,
-        num_new_tokens: int,
-        num_computed_tokens: int,
-        num_reqs: int,
-        # TODO: chunked prefill should be included
     ) -> None:
         if not block_ids:
             return
-        # num_new_tokens: 127
-        # num_new_tokens % 4: 3
-        # num_new_tokens % 128: 127
-        if (num_new_tokens + num_computed_tokens) % self.compress_ratio != 0:
-            # mask block_table
-            # 不满压缩比的时候要特殊适配，要去除最后一个 block-id，防止写的 blocktable 有问题
-            block_ids = block_ids[:-1]
 
         if self.use_hybrid_blocks:
             block_ids = self.map_to_kernel_blocks(
@@ -191,34 +177,15 @@ class BlockTable:
                 mask, slot_mapping, -1
             )
         else:
-            # position 要压缩？
-            # self.block_size: 2 (compressed)
-            # req_indices: [0]
-            # max_num_blocks_per_req: 10
-            # position：[0, 1, 2, 3, 4, 5, 6, 7]
-            # ratio：2
-            # dist positon: [0, 0, 1, 1, 2, 2, 3, 3]
-            
-            
-            # positions = positions // self.compress_ratio
             block_table_indices = (
                 req_indices * self.max_num_blocks_per_req + positions // self.block_size
             )
-            # block_table_indices: [[0]+[0,0,0,0, 1,1,1,1]]
 
             block_numbers = self.block_table.np.ravel()[block_table_indices]
-            # block_numbers: [2,2,2,2, 5,5,5,5]
-
             block_offsets = positions % self.block_size
-            # block_offsets: [0,0, 1,1, 0,0, 1,1]
-            # 压缩完后的 slot mapping 要去重
-            # TODO(cmq): 把这边的逻辑都搬到 vllm-ascend 的 blocktable 去
-            # 1. 不满压缩比的时候，给 state_manager 放
-            # 2. state_manager 那边放满的时候，给 compress kv 放
-            # 3. overlap 要考虑
             np.add(
-                block_numbers * self.block_size, # [4,4,4,4, 10,10,10,10]
-                block_offsets,  # [4,4,5,5, 10,10,11,11]
+                block_numbers * self.block_size,
+                block_offsets,
                 out=self.slot_mapping.np[: req_indices.shape[0]],
             )
 
@@ -294,7 +261,6 @@ class MultiGroupBlockTable:
         device: torch.device,
         block_sizes: list[int],
         kernel_block_sizes: list[int],
-        compress_ratios: list[int],
         num_speculative_tokens: int = 0,
         cp_kv_cache_interleave_size: int = 1,
     ) -> None:
@@ -333,10 +299,9 @@ class MultiGroupBlockTable:
                 pin_memory,
                 device,
                 kernel_block_size,
-                compress_ratio,
                 cp_kv_cache_interleave_size,
             )
-            for block_size, kernel_block_size, compress_ratio in zip(block_sizes, kernel_block_sizes, compress_ratios)
+            for block_size, kernel_block_size in zip(block_sizes, kernel_block_sizes)
         ]
 
     def append_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:
