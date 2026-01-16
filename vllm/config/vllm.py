@@ -928,7 +928,7 @@ class VllmConfig:
             # Default to disable HMA, but only if the user didn't express a preference.
             if self.kv_transfer_config is not None:
                 # NOTE(Kuntai): turn HMA off for connector unless specifically enabled.
-                need_disable_hybrid_kv_cache_manager = True
+                need_disable_hybrid_kv_cache_manager = False
                 logger.warning(
                     "Turning off hybrid kv cache manager because "
                     "`--kv-transfer-config` is set. This will reduce the "
