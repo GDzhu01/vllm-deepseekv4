@@ -224,9 +224,10 @@ class EngineCore:
         kv_cache_specs_list = self.model_executor.get_kv_cache_specs()
 
         has_kv_cache = False
-        for layer_specs_list in kv_cache_specs_list.values():
-            for layer_spec in layer_specs_list:
-                has_kv_cache = layer_spec is not None
+        for layer_specs_list_one_worker in kv_cache_specs_list:
+            for layer_specs_list in layer_specs_list_one_worker.values():
+                for layer_spec in layer_specs_list:
+                    has_kv_cache = layer_spec is not None
 
         if has_kv_cache:
             if os.environ.get("VLLM_ELASTIC_EP_SCALE_UP_LAUNCH") == "1":
