@@ -570,19 +570,6 @@ def get_kv_cache_coordinator(
     hash_block_size: int,
     metrics_collector: KVCacheMetricsCollector | None = None,
 ) -> KVCacheCoordinator:
-    is_dsv4 = True
-    if is_dsv4: # TODO(lxs) : need to remove
-        return CompressKVCacheCoordinator(
-            kv_cache_config,
-            max_model_len,
-            use_eagle,
-            enable_caching,
-            enable_kv_cache_events,
-            dcp_world_size=dcp_world_size,
-            pcp_world_size=pcp_world_size,
-            hash_block_size=hash_block_size,
-            metrics_collector=metrics_collector,
-        )
     if not enable_caching:
         return KVCacheCoordinatorNoPrefixCache(
             kv_cache_config,
