@@ -789,7 +789,7 @@ spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
     SlidingWindowSpec: SlidingWindowManager,
     ChunkedLocalAttentionSpec: ChunkedLocalAttentionManager,
     MambaSpec: MambaManager,
-    CrossAttentionSpec: CrossAttentionManager,
+    CrossAttentionSpec: CrossAttentionManager,    
 }
 
 
