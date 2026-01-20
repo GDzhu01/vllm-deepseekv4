@@ -345,7 +345,11 @@ class KVCacheManager:
             num_tokens_main_model=num_tokens_main_model,
         )
 
+        print(60*"=")
+        print(f"free blocks: {self.block_pool.get_num_free_blocks()}")
+        print(f"{num_blocks_to_allocate=}")
         if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
+            print(f"Cannot allocate new blocks")
             # Cannot allocate new blocks
             return None
 

@@ -510,6 +510,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     # the last iteration.
                     num_blocks = curr_hit_length // spec.block_size
                     curr_hit_length = num_blocks * spec.block_size
+                    # # TODO(cmq): check me, this is the merge conflict from ds
+                    # for group_id in group_ids:
+                    #     blocks = hit_blocks_by_group[group_id]
+                    #     assert blocks is not None
+                    #     del blocks[num_blocks:]
                 else:
                     hit_blocks = manager_cls.find_longest_cache_hit(
                         block_hashes=_get_block_hashes(spec),
