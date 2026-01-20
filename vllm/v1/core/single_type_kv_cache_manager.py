@@ -4,6 +4,7 @@ import itertools
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
+from typing import Optional
 
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
@@ -789,7 +790,7 @@ class CrossAttentionManager(SingleTypeKVCacheManager):
 
 class CompressAttentionManager(SingleTypeKVCacheManager):
     def __init__(
-        self, kv_cache_spec: CompressAttentionSpec, block_pool: BlockPool, **kwargs
+        self, kv_cache_spec: Optional[CompressAttentionSpec | CompressIndexerAttentionSpec], block_pool: BlockPool, **kwargs
     ) -> None:
         super().__init__(kv_cache_spec, block_pool, **kwargs)
         self.compress_ratio = kv_cache_spec.compress_ratio
@@ -803,7 +804,8 @@ class CompressAttentionManager(SingleTypeKVCacheManager):
     ) -> int:
         # Allocate extra `num_speculative_blocks` blocks for
         # speculative decoding (MTP/EAGLE) with linear attention.
-        assert isinstance(self.kv_cache_spec, CompressAttentionSpec)
+        assert isinstance(self.kv_cache_spec, CompressAttentionSpec) or \
+            isinstance(self.kv_cache_spec, CompressIndexerAttentionSpec)
 
         num_tokens //= self.compress_ratio
 
