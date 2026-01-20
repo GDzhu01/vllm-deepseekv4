@@ -212,6 +212,12 @@ class Scheduler(SchedulerInterface):
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
+        # TODO refactor me later
+        self.use_compress = hasattr(self.vllm_config.model_config.hf_config,
+                            "compress_ratios")
+        if self.use_compress:
+            self.compress_ratio = max(self.vllm_config.model_config.hf_config.compress_ratios)
+            print(f"{self.compress_ratio=}")
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -262,12 +268,19 @@ class Scheduler(SchedulerInterface):
                 # partial draft tokens since this prevents uniform decode optimizations.
                 req_index += 1
                 continue
-
-            num_new_tokens = (
+            
+            if self.use_compress:
+                remain_tokens = num_new_tokens = (
                 request.num_tokens_with_spec
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
+            else:
+                num_new_tokens = (
+                    request.num_tokens_with_spec
+                    + request.num_output_placeholders
+                    - request.num_computed_tokens
+                )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
@@ -277,7 +290,13 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = min(
                 num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens
             )
-
+            if self.use_compress:
+                # we need align chunk size with compress_ratio to avoid wrong cache r/w
+                # caused by current chunked prefill impl
+                if remain_tokens != num_new_tokens:
+                    num_new_tokens = (num_new_tokens // self.compress_ratio) * self.compress_ratio
+                    if token_budget - num_new_tokens < self.compress_ratio:
+                        token_budget = num_new_tokens
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
             external_load_encoder_input: list[int] = []
@@ -524,6 +543,8 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
+                    if self.use_compress:
+                        ori_num_new_tokens = num_new_tokens
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
@@ -539,6 +560,15 @@ class Scheduler(SchedulerInterface):
                         break
 
                     num_new_tokens = min(num_new_tokens, token_budget)
+                    if self.use_compress:
+                        # we need align chunk size with block_size to avoid wrong cache r/w
+                        # caused by current chunked prefill impl
+                        if ori_num_new_tokens != num_new_tokens:
+                            num_new_tokens = (num_new_tokens // self.compress_ratio) * self.compress_ratio
+                            if num_new_tokens==0:
+                                break
+                            if token_budget - num_new_tokens < self.compress_ratio:
+                                token_budget = num_new_tokens
                     assert num_new_tokens > 0
 
                     # Schedule encoder inputs.

@@ -347,6 +347,8 @@ class InputBatch:
         self.num_tokens_no_spec[req_index] = request.num_tokens
 
         self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens
+        # print(f"{req_index=}")
+        # print(f"{request.block_ids=}")
         self.block_table.add_row(request.block_ids, req_index)
 
         if sampling_params := request.sampling_params:

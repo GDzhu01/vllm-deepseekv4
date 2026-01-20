@@ -125,7 +125,7 @@ class Executor(ABC):
     def determine_available_memory(self) -> list[int]:  # in bytes
         return self.collective_rpc("determine_available_memory")
 
-    def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
+    def get_kv_cache_specs(self) -> list[dict[str, list[KVCacheSpec]]]:
         return self.collective_rpc("get_kv_cache_spec")
 
     @overload

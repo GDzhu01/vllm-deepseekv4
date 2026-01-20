@@ -13,6 +13,7 @@ from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_dtype_size
 
+
 logger = init_logger(__name__)
 
 
@@ -66,6 +67,7 @@ class AttentionSpec(KVCacheSpec):
     num_kv_heads: int
     head_size: int
     dtype: torch.dtype
+    pad_size: int
 
     @property
     def page_size_bytes(self) -> int:
@@ -283,6 +285,14 @@ class CrossAttentionSpec(AttentionSpec):
         max_encoder_len = vllm_config.scheduler_config.max_num_encoder_input_tokens
         return cdiv(max_encoder_len, self.block_size) * self.page_size_bytes
 
+def get_all_kvcache_specs_from_list(
+    kv_cache_spec_list: dict[str, list[KVCacheSpec]],
+) -> list[KVCacheSpec]:
+    all_kv_cache_specs = []
+    for layer_name, layer_spec_list in kv_cache_spec_list.items():
+        for layer_specs in layer_spec_list:
+            all_kv_cache_specs.append(layer_specs)
+    return all_kv_cache_specs
 
 @dataclass(frozen=True)
 class UniformTypeKVCacheSpecs(KVCacheSpec):
@@ -293,54 +303,63 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
     and should not be merged into one UniformTypeKVCacheSpecs.
     """
 
+    kv_cache_specs_list: dict[str, list[KVCacheSpec]]
     kv_cache_specs: dict[str, KVCacheSpec]
 
     @property
     def page_size_bytes(self) -> int:
-        return sum(spec.page_size_bytes for spec in self.kv_cache_specs.values())
+        all_specs = get_all_kvcache_specs_from_list(self.kv_cache_specs_list)
+        return sum(spec.page_size_bytes for spec in all_specs)
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        all_specs = get_all_kvcache_specs_from_list(self.kv_cache_specs_list)
         max_num_pages = max(
             cdiv(spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes)
-            for spec in self.kv_cache_specs.values()
+            for spec in all_specs
         )
         return max_num_pages * self.page_size_bytes
 
     @classmethod
-    def is_uniform_type(cls, kv_cache_specs: dict[str, KVCacheSpec]) -> bool:
+    def is_uniform_type(cls, kv_cache_specs_list: dict[str, list[KVCacheSpec]]) -> bool:
         """
         Whether all layers have the same type of KV cache spec.
         """
-        block_sizes = set(spec.block_size for spec in kv_cache_specs.values())
+        all_specs = get_all_kvcache_specs_from_list(kv_cache_specs_list)
+        block_sizes = set(spec.block_size for spec in all_specs)
         if len(block_sizes) > 1:
             # Different block sizes, not uniform.
             return False
-        one_spec = next(iter(kv_cache_specs.values()))
+        for _, layer_specs in kv_cache_specs_list.items():
+            if len(layer_specs) == 1:
+                # Different specs in one layer, not uniform
+                return False
+
+        one_spec = next(iter(cls.kv_cache_specs.values()))
         if isinstance(one_spec, FullAttentionSpec):
             return all(
-                isinstance(spec, FullAttentionSpec) for spec in kv_cache_specs.values()
+                isinstance(spec, FullAttentionSpec) for spec in cls.kv_cache_specs.values()
             )
         elif isinstance(one_spec, CrossAttentionSpec):
             return all(
-                isinstance(spec, CrossAttentionSpec) for spec in kv_cache_specs.values()
+                isinstance(spec, CrossAttentionSpec) for spec in cls.kv_cache_specs.values()
             )
         elif isinstance(one_spec, SlidingWindowSpec):
             return all(
                 isinstance(spec, SlidingWindowSpec)
                 and spec.sliding_window == one_spec.sliding_window
-                for spec in kv_cache_specs.values()
+                for spec in cls.kv_cache_specs.values()
             )
         elif isinstance(one_spec, ChunkedLocalAttentionSpec):
             return all(
                 isinstance(spec, ChunkedLocalAttentionSpec)
                 and spec.attention_chunk_size == one_spec.attention_chunk_size
-                for spec in kv_cache_specs.values()
+                for spec in cls.kv_cache_specs.values()
             )
         elif isinstance(one_spec, MambaSpec):
             return all(
                 isinstance(spec, MambaSpec)
                 and spec.num_speculative_blocks == one_spec.num_speculative_blocks
-                for spec in kv_cache_specs.values()
+                for spec in cls.kv_cache_specs.values()
             )
         else:
             # NOTE(Chen): Please add new branches for new KV cache spec types.
@@ -349,14 +368,19 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
             )
 
     @classmethod
-    def from_specs(cls, kv_cache_specs: dict[str, KVCacheSpec]) -> Self | None:
+    def from_specs(cls, kv_cache_specs_list: dict[str, list[KVCacheSpec]]) -> Self | None:
         """
         Return a SameTypeKVCacheSpecs object if all layers have the same type
         of KV cache spec. Return None if not.
         """
-        if cls.is_uniform_type(kv_cache_specs):
+        if cls.is_uniform_type(kv_cache_specs_list):
+
+            kv_cache_specs: dict[str, KVCacheSpec] = {}
+            for layer_name, layer_specs in kv_cache_specs_list.items():
+                kv_cache_specs[layer_name] = layer_specs[0]
+
             block_size = next(iter(kv_cache_specs.values())).block_size
-            return cls(block_size=block_size, kv_cache_specs=kv_cache_specs)
+            return cls(block_size=block_size, kv_cache_specs=kv_cache_specs, kv_cache_specs_list=kv_cache_specs_list)
         else:
             return None
 

@@ -4,6 +4,7 @@ import itertools
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
+from typing import Optional
 
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
@@ -789,7 +790,7 @@ spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
     SlidingWindowSpec: SlidingWindowManager,
     ChunkedLocalAttentionSpec: ChunkedLocalAttentionManager,
     MambaSpec: MambaManager,
-    CrossAttentionSpec: CrossAttentionManager,
+    CrossAttentionSpec: CrossAttentionManager, 
 }
 
 
