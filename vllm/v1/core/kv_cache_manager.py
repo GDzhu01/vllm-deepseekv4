@@ -128,7 +128,7 @@ class KVCacheManager:
             metrics_collector=self.metrics_collector,
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
-        self.block_pools = self.coordinator.block_pools
+        self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
 
         # Pre-constructed KVCacheBlocks with no blocks, callers should use this

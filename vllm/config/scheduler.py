@@ -161,10 +161,6 @@ class SchedulerConfig:
 
                 return AsyncScheduler
             from vllm.v1.core.sched.scheduler import Scheduler
-            is_dsv4 = True
-            if is_dsv4:
-                from vllm.v1.core.sched.scheduler_compress import CompressScheduler as Scheduler
-
             return Scheduler
 
         # This warning can be removed once the Scheduler interface is
