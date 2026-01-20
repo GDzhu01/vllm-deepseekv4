@@ -18,7 +18,8 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
     CompressAttentionSpec,
     Compress4AttentionSpec,
-    Compress128AttentionSpec
+    Compress128AttentionSpec,
+    CompressIndexerAttentionSpec,
 )
 from vllm.v1.request import Request
 
@@ -907,6 +908,7 @@ spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
     CrossAttentionSpec: CrossAttentionManager,
     Compress4AttentionSpec: CompressAttentionManager,
     Compress128AttentionSpec: CompressAttentionManager,
+    CompressIndexerAttentionSpec: CompressAttentionManager,
 }
 
 
