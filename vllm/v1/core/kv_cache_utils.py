@@ -24,6 +24,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheTensor,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
+    get_all_kvcache_specs_from_list,
 )
 from vllm.v1.request import Request
 from vllm.v1.utils import tensor_data
@@ -662,14 +663,7 @@ def estimate_max_model_len(
     return result
 
 
-def get_all_kvcache_specs_from_list(
-    kv_cache_spec_list: dict[str, list[KVCacheSpec]],
-) -> list[KVCacheSpec]:
-    all_kv_cache_specs = []
-    for layer_name, layer_spec_list in kv_cache_spec_list.items():
-        for layer_specs in layer_spec_list:
-            all_kv_cache_specs.append(layer_specs)
-    return all_kv_cache_specs
+
 
 def check_enough_kv_cache_memory(
     vllm_config: VllmConfig,
@@ -751,28 +745,22 @@ def create_kv_cache_group_specs(
     """
     kv_cache_groups = []
 
-    # TODO(cmq): choose one to keep
-    # plan a
+    # TODO(cmq): REFACTOR ME
     for layer_names_one_group in grouped_layer_names:
-        for layer_spec_list in kv_cache_spec_list.values():
-            for idx, _ in enumerate(layer_spec_list):
-                layer_specs = [
-                    kv_cache_spec_list[layer_name][idx] for layer_name in layer_names_one_group
-                ]
-                merged_layer_spec = layer_specs[0].merge(layer_specs)
-                kv_cache_groups.append(
-                    KVCacheGroupSpec(layer_names_one_group, merged_layer_spec)
-                )
-
-    # plan b
-    # TODO(cmq): check if this is correct?
-    for layer_names_one_group in grouped_layer_names:
-        layer_specs_list:list[list[KVCacheSpec]] = [[]]
+        skip = False
+        for kv_group in kv_cache_groups:
+            if layer_names_one_group == kv_group.layer_names:
+                skip = True
+        if skip:
+            continue
+        layer_specs_list:list[list[KVCacheSpec]] = [[],[]]
         for layer_name in layer_names_one_group:
             layer_spec_list = kv_cache_spec_list[layer_name]
             for idx, layer_spec in enumerate(layer_spec_list):
                 layer_specs_list[idx].append(layer_spec)
         for layer_specs in layer_specs_list:
+            if len(layer_specs) == 0:
+                continue
             merged_layer_spec = layer_specs[0].merge(layer_specs)
             kv_cache_groups.append(
                 KVCacheGroupSpec(layer_names_one_group, merged_layer_spec)

@@ -12,7 +12,6 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_dtype_size
-from vllm.v1.core.kv_cache_utils import get_all_kvcache_specs_from_list
 
 
 logger = init_logger(__name__)
@@ -285,6 +284,14 @@ class CrossAttentionSpec(AttentionSpec):
         max_encoder_len = vllm_config.scheduler_config.max_num_encoder_input_tokens
         return cdiv(max_encoder_len, self.block_size) * self.page_size_bytes
 
+def get_all_kvcache_specs_from_list(
+    kv_cache_spec_list: dict[str, list[KVCacheSpec]],
+) -> list[KVCacheSpec]:
+    all_kv_cache_specs = []
+    for layer_name, layer_spec_list in kv_cache_spec_list.items():
+        for layer_specs in layer_spec_list:
+            all_kv_cache_specs.append(layer_specs)
+    return all_kv_cache_specs
 
 @dataclass(frozen=True)
 class UniformTypeKVCacheSpecs(KVCacheSpec):
@@ -442,6 +449,7 @@ class Compress4AttentionSpec(CompressAttentionSpec):
 
 @dataclass(frozen=True)
 class CompressIndexerAttentionSpec(AttentionSpec):
+    compress_ratio: int
     # indexer attn
     #   value head_dim = 128  A3: int8 A5: fp8
     #   scale head_dim = 1 A3: fp16 A5: fp32
@@ -454,6 +462,16 @@ class CompressIndexerAttentionSpec(AttentionSpec):
             The page size
         """
         return self.block_size * self.head_size * get_dtype_size(self.dtype)
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        """
+        The maximum possible memory usage of this KV cache in bytes.
+
+        Returns:
+            The KV cache size in bytes
+        """
+        max_model_len = vllm_config.model_config.max_model_len
+        return cdiv(max_model_len, self.block_size) * self.page_size_bytes
 
 @dataclass(frozen=True)
 class Compress128AttentionSpec(CompressAttentionSpec):
