@@ -572,25 +572,18 @@ class CompressKVCacheCoordinator(KVCacheCoordinator):
                 pcp_world_size=pcp_world_size, # TODO we can add a pool_id param to bind different manager 
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
-        )    
+        )
+        self.num_single_type_manager = len(self.single_type_managers)
 
     def find_longest_cache_hit(
         self,
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
-        hit_blocks = self.single_type_managers[0].find_longest_cache_hit(
-            block_hashes=block_hashes,
-            max_length=max_cache_hit_length,
-            kv_cache_group_ids=[0],
-            block_pool=self.block_pool,
-            kv_cache_spec=self.kv_cache_spec,
-            use_eagle=self.use_eagle,
-            alignment_tokens=self.block_size,
-            dcp_world_size=self.dcp_world_size,
-            pcp_world_size=self.pcp_world_size,
+        blocks: tuple[list[KVCacheBlock], ...] = tuple(
+            [] for _ in range(self.num_single_type_manager)
         )
-        return hit_blocks, len(hit_blocks[0]) * self.block_size
+        return blocks, 0
 
 
 def get_kv_cache_coordinator(
