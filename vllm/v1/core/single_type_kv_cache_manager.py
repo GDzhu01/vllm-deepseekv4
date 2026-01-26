@@ -836,7 +836,7 @@ class CompressAttentionManager(SingleTypeKVCacheManager):
         if num_new_blocks <= 0:
             return []
         else:
-            new_blocks = self.block_pool.get_new_blocks(num_new_blocks, self.kv_cache_group_id)
+            new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
             req_blocks.extend(new_blocks)
             return new_blocks
 
@@ -868,8 +868,8 @@ class CompressAttentionManager(SingleTypeKVCacheManager):
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
     ) -> tuple[list[KVCacheBlock], ...]:
-        assert isinstance(kv_cache_spec, CompressAttentionSpec), (
-            "SFACompressRatio4Manager can only be used for C128"
+        assert isinstance(kv_cache_spec, KVCacheSpec), (
+            "CompressAttentionManager can only be used for KVCacheSpec"
         )
         assert dcp_world_size == 1, "DCP not support mamba now."
         assert pcp_world_size == 1, "PCP not support mamba now."
@@ -898,7 +898,7 @@ class CompressAttentionManager(SingleTypeKVCacheManager):
         # freed first.
         ordered_blocks = reversed(req_blocks)
 
-        self.block_pool.free_blocks(ordered_blocks, self.kv_cache_group_id)
+        self.block_pool.free_blocks(ordered_blocks)
         self.num_cached_block.pop(request_id, None)
 
 spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
