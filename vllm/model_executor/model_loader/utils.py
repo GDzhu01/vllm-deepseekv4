@@ -11,7 +11,7 @@ import torch
 from torch import nn
 from typing_extensions import assert_never
 
-from vllm.attention.layer import Attention, MLAAttention
+from vllm.attention.layer import Attention, MLAAttention, DSAAttention
 from vllm.config import ModelConfig, VllmConfig, set_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
@@ -110,7 +110,7 @@ def process_weights_after_loading(
     # Initialize post-load attention weights for both Attention and MLA.
     # NOTE: Happens after other modules so we can easily decompress weights.
     for _, module in model.named_modules():
-        if isinstance(module, (Attention, MLAAttention)) and hasattr(
+        if isinstance(module, (Attention, MLAAttention, DSAAttention)) and hasattr(
             module, "process_weights_after_loading"
         ):
             # TODO(lucas): see if there is a way to unify the signatures
