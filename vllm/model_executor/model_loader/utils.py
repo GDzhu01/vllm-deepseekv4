@@ -11,7 +11,8 @@ import torch
 from torch import nn
 from typing_extensions import assert_never
 
-from vllm.attention.layer import Attention, MLAAttention, DSAAttention
+from vllm.attention.layer import Attention, MLAAttention
+from vllm_ascend.models.layer.attention.layer import DSAAttention
 from vllm.config import ModelConfig, VllmConfig, set_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
