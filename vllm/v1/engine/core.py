@@ -221,13 +221,10 @@ class EngineCore:
         start = time.time()
 
         # Get all kv cache needed by the model
-        kv_cache_specs_list = self.model_executor.get_kv_cache_specs()
+        kv_cache_specs = self.model_executor.get_kv_cache_specs()
 
         has_kv_cache = False
-        for layer_specs_list_one_worker in kv_cache_specs_list:
-            for layer_specs_list in layer_specs_list_one_worker.values():
-                for layer_spec in layer_specs_list:
-                    has_kv_cache = layer_spec is not None
+        has_kv_cache = any(kv_cache_spec for kv_cache_spec in kv_cache_specs)
 
         if has_kv_cache:
             if os.environ.get("VLLM_ELASTIC_EP_SCALE_UP_LAUNCH") == "1":
@@ -237,7 +234,7 @@ class EngineCore:
                     ParallelConfig.sync_kv_cache_memory_size(dp_group, -1)
                 )
                 available_gpu_memory = [self.available_gpu_memory_for_kv_cache] * len(
-                    kv_cache_specs_list
+                    kv_cache_specs
                 )
             else:
                 # Profiles the peak memory usage of the model to determine how
@@ -246,12 +243,12 @@ class EngineCore:
                 self.available_gpu_memory_for_kv_cache = available_gpu_memory[0]
         else:
             # Attention free models don't need memory for kv cache
-            available_gpu_memory = [0] * len(kv_cache_specs_list)
+            available_gpu_memory = [0] * len(kv_cache_specs)
 
-        assert len(kv_cache_specs_list) == len(available_gpu_memory)
+        assert len(kv_cache_specs) == len(available_gpu_memory)
 
         kv_cache_configs = get_kv_cache_configs(
-            vllm_config, kv_cache_specs_list, available_gpu_memory
+            vllm_config, kv_cache_specs, available_gpu_memory
         )
         scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
         num_gpu_blocks = scheduler_kv_cache_config.num_blocks

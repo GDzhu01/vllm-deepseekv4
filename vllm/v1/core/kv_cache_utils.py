@@ -753,7 +753,11 @@ def create_kv_cache_group_specs(
                 skip = True
         if skip:
             continue
+        # TODO(cmq): REFACTOR ME: `layer_specs_list` should be initialized with the length of groups
         layer_specs_list:list[list[KVCacheSpec]] = [[],[]]
+        # [[c4_0, c4_1, c4_2], [c128_0, c128_1, c128_2]]
+
+        # [c4_0, c128_0]
         for layer_name in layer_names_one_group:
             layer_spec_list = kv_cache_spec_list[layer_name]
             for idx, layer_spec in enumerate(layer_spec_list):
@@ -1038,6 +1042,10 @@ def _get_kv_cache_groups_uniform_page_size(
         for layer_spec in layer_spec_list:
             same_type_layers[layer_spec].append(layer_name)
 
+    # layer0 --> spec0, spec1
+    # layer1 --> spec2
+    # spec0, spec1, spec2
+
     # Split each group into smaller groups, to make the number of layers in each
     # group identical. Add padding to the last group of each type if necessary.
     # E.g., (full.0, full.1), (sw.0, sw.1, sw.2)
@@ -1051,7 +1059,8 @@ def _get_kv_cache_groups_uniform_page_size(
     # strategy if we want to support more complex patterns (e.g., 20 full + 30
     # sw, where the group size should be 10).
     min_num_layers = min([len(layers) for layers in same_type_layers.values()])
-    group_size = min_num_layers
+    # TODO(cmq): REFACTOR ME to more general logic
+    group_size = 22
     max_num_layers = max([len(layers) for layers in same_type_layers.values()])
     if max_num_layers < min_num_layers * 1.25:
         # If the number of layers is not much larger than the minimum number of layers,
@@ -1354,7 +1363,7 @@ def _report_kv_cache_config(
 
 def get_kv_cache_configs(
     vllm_config: VllmConfig,
-    kv_cache_specs_list: list[dict[str, list[KVCacheSpec]]],
+    kv_cache_specs: list[dict[str, list[KVCacheSpec]]],
     available_memory: list[int],
 ) -> list[KVCacheConfig]:
     """
@@ -1386,7 +1395,7 @@ def get_kv_cache_configs(
 
     # Check if the available memory is enough for each worker.
     for kv_cache_spec_list_one_worker, available_memory_one_worker in zip(
-        kv_cache_specs_list, available_memory
+        kv_cache_specs, available_memory
     ):
         check_enough_kv_cache_memory(
             vllm_config, kv_cache_spec_list_one_worker, available_memory_one_worker
@@ -1396,7 +1405,7 @@ def get_kv_cache_configs(
     # different layer names, and different TP ranks of the same PP stage should
     # have the same KV cache spec.
     merged_kv_cache_specs_list: dict[str, list[KVCacheSpec]] = {}
-    for kv_cache_spec_list_one_worker in kv_cache_specs_list:
+    for kv_cache_spec_list_one_worker in kv_cache_specs:
         for layer_name, layer_spec_list in kv_cache_spec_list_one_worker.items():
             if layer_name not in merged_kv_cache_specs_list:
                 merged_kv_cache_specs_list[layer_name] = layer_spec_list
@@ -1409,7 +1418,7 @@ def get_kv_cache_configs(
 
     kv_cache_configs: list[KVCacheConfig] = []
     for kv_cache_spec_list_one_worker, available_memory_one_worker in zip(
-        kv_cache_specs_list, available_memory
+        kv_cache_specs, available_memory
     ):
         kv_cache_groups_one_worker: list[KVCacheGroupSpec] = []
         for group in global_kv_cache_groups:

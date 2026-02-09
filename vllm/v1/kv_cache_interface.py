@@ -67,6 +67,7 @@ class AttentionSpec(KVCacheSpec):
     num_kv_heads: int
     head_size: int
     dtype: torch.dtype
+    pad_size: int | None = None
 
     @property
     def page_size_bytes(self) -> int:
@@ -382,119 +383,6 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
             return cls(block_size=block_size, kv_cache_specs=kv_cache_specs, kv_cache_specs_list=kv_cache_specs_list)
         else:
             return None
-
-
-def pad_to_128(x: int):
-    return ((x + 127) // 128) * 128
-
-@dataclass(frozen=True)
-class CompressAttentionSpec(AttentionSpec):
-    nope_dim: int
-    rope_dim: int
-    scale_dim: int
-    nope_dtype: torch.dtype = torch.bfloat16
-    rope_dtype: torch.dtype = torch.bfloat16
-    scale_dtype: torch.dtype = torch.bfloat16
-
-    compress_ratio: int = 1
-
-    @property
-    def page_size_bytes(self) -> int:
-        """
-        The size of a page with `block_size` tokens in bytes.
-
-        Returns:
-            The page size
-        """
-        base_page_size = self.block_size * self.head_size * 1 * get_dtype_size(self.dtype)
-        indexer_page_size = self.block_size * self.indexer_head_size * 1 * get_dtype_size(self.dtype)
-        page_size = (base_page_size + indexer_page_size) // self.compress_ratio
-
-        return page_size
-
-    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
-        """
-        The maximum possible memory usage of this KV cache in bytes.
-
-        Returns:
-            The KV cache size in bytes
-        """
-        max_model_len = vllm_config.model_config.max_model_len
-        return cdiv(max_model_len, self.block_size) * self.page_size_bytes
-
-
-@dataclass(frozen=True)
-class Compress4AttentionSpec(CompressAttentionSpec):
-    # c4
-    #   nope+rope+scale head_dim = 448    +    64  +  7
-    #                           A5: fp8        bf16   fp8
-    #                           A3: bf16       bf16    /
-    #   pad to 128 to make sure the perfermance is ok
-
-    @property
-    def page_size_bytes(self) -> int:
-        """
-        The size of a page with `block_size` tokens in bytes.
-
-        Returns:
-            The page size
-        """
-        page_size = self.block_size * (
-            self.nope_dim * get_dtype_size(self.nope_dtype) + \
-            self.rope_dim * get_dtype_size(self.rope_dtype) + \
-            self.scale_dim * get_dtype_size(self.scale_dtype)
-        )
-        return pad_to_128(page_size)
-
-
-@dataclass(frozen=True)
-class CompressIndexerAttentionSpec(AttentionSpec):
-    compress_ratio: int
-    # indexer attn
-    #   value head_dim = 128  A3: int8 A5: fp8
-    #   scale head_dim = 1 A3: fp16 A5: fp32
-    @property
-    def page_size_bytes(self) -> int:
-        """
-        The size of a page with `block_size` tokens in bytes.
-
-        Returns:
-            The page size
-        """
-        return self.block_size * self.head_size * get_dtype_size(self.dtype)
-
-    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
-        """
-        The maximum possible memory usage of this KV cache in bytes.
-
-        Returns:
-            The KV cache size in bytes
-        """
-        max_model_len = vllm_config.model_config.max_model_len
-        return cdiv(max_model_len, self.block_size) * self.page_size_bytes
-
-@dataclass(frozen=True)
-class Compress128AttentionSpec(CompressAttentionSpec):
-    # c128
-    #   nope+rope+scale head_dim = 448    +    64  +  7
-    #                           A5: fp8        bf16   fp8
-    #                           A3: bf16       bf16    /
-    #   pad to 128 to make sure the perfermance is ok
-
-    @property
-    def page_size_bytes(self) -> int:
-        """
-        The size of a page with `block_size` tokens in bytes.
-
-        Returns:
-            The page size
-        """
-        page_size = self.block_size * (
-            self.nope_dim * get_dtype_size(self.nope_dtype) + \
-            self.rope_dim * get_dtype_size(self.rope_dtype) + \
-            self.scale_dim * get_dtype_size(self.scale_dtype)
-        )
-        return pad_to_128(page_size)
 
 
 @dataclass
