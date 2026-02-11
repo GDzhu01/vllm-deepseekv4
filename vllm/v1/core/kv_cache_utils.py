@@ -1061,7 +1061,7 @@ def _get_kv_cache_groups_uniform_page_size(
     # sw, where the group size should be 10).
     min_num_layers = min([len(layers) for layers in same_type_layers.values()])
     # TODO(cmq): REFACTOR ME to more general logic
-    group_size = 22
+
     max_num_layers = max([len(layers) for layers in same_type_layers.values()])
     if max_num_layers < min_num_layers * 1.25:
         # If the number of layers is not much larger than the minimum number of layers,
@@ -1070,15 +1070,17 @@ def _get_kv_cache_groups_uniform_page_size(
         # pad it to (13 sw, 13 full) instead of (12 sw, 24 full). 1.25 is just a
         # magic number to avoid too many padding layers.
         group_size = max_num_layers
+    group_size = 2
     grouped_layers = []
-    for layers in same_type_layers.values():
+    group_layer_specs = []
+    for layer_spec, layers in same_type_layers.items():
         num_padding_layers = group_size - len(layers) % group_size
         if num_padding_layers != group_size:
             logger.warning(
                 "Add %d padding layers, may waste at most %.2f%% KV cache memory",  # noqa
                 num_padding_layers,
                 num_padding_layers / len(layers) * 100,
-            )
+            ) 
         num_groups = cdiv(len(layers), group_size)
         # In PP case, say if we have
         # - stage 0: full.0, sw.0, sw.1
@@ -1093,7 +1095,15 @@ def _get_kv_cache_groups_uniform_page_size(
         # instead of layers[i * group_size: (i + 1) * group_size]
         for i in range(num_groups):
             grouped_layers.append(layers[i::num_groups])
-    return create_kv_cache_group_specs(kv_cache_spec_list, grouped_layers)
+            group_layer_specs.append(layer_spec)
+    kv_cache_groups = []
+    for group_layer_spec, layer_names_one_group in zip(group_layer_specs, grouped_layers):
+        kv_cache_groups.append(
+            KVCacheGroupSpec(layer_names_one_group, group_layer_spec)
+        )
+    return kv_cache_groups
+    # TODO (wjq) refactor me later
+    # return create_kv_cache_group_specs(kv_cache_spec_list, grouped_layers)
 
 
 def get_kv_cache_config_from_groups(
