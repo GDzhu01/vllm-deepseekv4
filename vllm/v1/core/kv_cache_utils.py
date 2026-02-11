@@ -755,9 +755,6 @@ def create_kv_cache_group_specs(
             continue
         # TODO(cmq): REFACTOR ME: `layer_specs_list` should be initialized with the length of groups
         layer_specs_list:list[list[KVCacheSpec]] = [[],[]]
-        # [[c4_0, c4_1, c4_2], [c128_0, c128_1, c128_2]]
-
-        # [c4_0, c128_0]
         for layer_name in layer_names_one_group:
             layer_spec_list = kv_cache_spec_list[layer_name]
             for idx, layer_spec in enumerate(layer_spec_list):
@@ -947,6 +944,10 @@ def unify_kv_cache_spec_page_size(
                     new_kv_cache_spec_list[layer_name] = [layer_spec]
             else:
                 layer_page_size = layer_spec.page_size_bytes
+                print(f"{layer_name=}")
+                print(f"{max_page_size=}")
+                print(f"{layer_spec=}")
+                print(f"{layer_page_size=}")
                 if max_page_size % layer_page_size != 0:
                     raise NotImplementedError(
                         "The page size of the layer is not divisible by the "
