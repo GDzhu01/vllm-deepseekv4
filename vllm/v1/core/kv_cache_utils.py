@@ -1070,7 +1070,7 @@ def _get_kv_cache_groups_uniform_page_size(
         # pad it to (13 sw, 13 full) instead of (12 sw, 24 full). 1.25 is just a
         # magic number to avoid too many padding layers.
         group_size = max_num_layers
-    group_size = 2
+    group_size = 22
     grouped_layers = []
     group_layer_specs = []
     for layer_spec, layers in same_type_layers.items():
