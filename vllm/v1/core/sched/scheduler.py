@@ -291,7 +291,7 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens
             )
             if self.use_compress:
-                # we need align chunk size with block_size to avoid wrong cache r/w
+                # we need align chunk size with compress_ratio to avoid wrong cache r/w
                 # caused by current chunked prefill impl
                 if remain_tokens != num_new_tokens:
                     num_new_tokens = (num_new_tokens // self.compress_ratio) * self.compress_ratio
@@ -565,6 +565,8 @@ class Scheduler(SchedulerInterface):
                         # caused by current chunked prefill impl
                         if ori_num_new_tokens != num_new_tokens:
                             num_new_tokens = (num_new_tokens // self.compress_ratio) * self.compress_ratio
+                            if num_new_tokens==0:
+                                break
                             if token_budget - num_new_tokens < self.compress_ratio:
                                 token_budget = num_new_tokens
                     assert num_new_tokens > 0
