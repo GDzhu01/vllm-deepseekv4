@@ -371,6 +371,69 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         self.sliding_window = kv_cache_spec.sliding_window
         self._null_block = block_pool.null_block
 
+    def get_num_blocks_to_allocate(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: Sequence[KVCacheBlock],
+    ) -> int:
+        # Allocate extra `num_speculative_blocks` blocks for
+        # speculative decoding (MTP/EAGLE) with linear attention.
+        # TODO NOTE(cmq): This only address the issue that num_blocks is too large to request
+        #  a long sequence, but introduce an issue that prefix caching is broken.
+        # see BlockHashListWithBlockSize for more details.
+        num_tokens = cdiv(num_tokens, 128 * 128 // self.kv_cache_spec.block_size)        
+        # (cdiv(num_tokens, 128 * 128) + 1)
+
+        return super().get_num_blocks_to_allocate(request_id, num_tokens,
+                                                  new_computed_blocks)
+
+    def allocate_new_blocks(self, request_id: str,
+                            num_tokens: int) -> list[KVCacheBlock]:
+        """
+        Allocate new blocks for the request to give it at least `num_tokens`
+        token slots.
+
+        Args:
+            request_id: The request ID.
+            num_tokens: The total number of tokens that need a slot (including
+                tokens that are already allocated).
+
+        Returns:
+            The new allocated blocks.
+        """
+        # TODO NOTE(cmq): This only address the issue that num_blocks is too large to request
+        #  a long sequence, but introduce an issue that prefix caching is broken.
+        # see BlockHashListWithBlockSize for more details.
+        num_tokens = cdiv(num_tokens, 128 * 128 // self.kv_cache_spec.block_size)        
+
+        req_blocks = self.req_to_blocks[request_id]
+        num_required_blocks = cdiv(num_tokens, self.block_size)
+        num_new_blocks = num_required_blocks - len(req_blocks)
+        if num_new_blocks <= 0:
+            return []
+        else:
+            new_blocks = self.block_pool.get_new_blocks(
+                num_new_blocks)
+            req_blocks.extend(new_blocks)
+            return new_blocks
+
+    def cache_blocks(self, request: Request, num_tokens: int) -> None:
+        """
+        Cache the blocks for the request.
+
+        Args:
+            request: The request.
+            num_tokens: The total number of tokens that need to be cached
+                (including tokens that are already cached).
+        """
+        # TODO NOTE(cmq): This only address the issue that num_blocks is too large to request
+        #  a long sequence, but introduce an issue that prefix caching is broken.
+        # see BlockHashListWithBlockSize for more details.
+        num_tokens = cdiv(num_tokens, 128 * 128 // self.kv_cache_spec.block_size)        
+
+        return super().cache_blocks(request, num_tokens)
+
     @classmethod
     def find_longest_cache_hit(
         cls,
@@ -407,12 +470,19 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         # O(max_num_blocks / sliding_window_contiguous_blocks +
         # sliding_window_contiguous_blocks),
         # which is good for low cache hit rate scenarios.
-        max_num_blocks = max_length // kv_cache_spec.block_size
+        new_block_size = 128 * 128
+        max_num_blocks = max_length // new_block_size
+        # print(60*"*")
+        # print(f"{kv_cache_spec=}")
+        # print(f"{kv_cache_group_ids=}")
+        # print(f"{max_length=}")
+        # print(f"{kv_cache_spec.block_size=}")
+        # print(f"{max_num_blocks=}")
         computed_blocks = tuple(
             [block_pool.null_block] * max_num_blocks
             for _ in range(len(kv_cache_group_ids))
         )
-        block_size = kv_cache_spec.block_size
+        block_size = new_block_size
         num_contiguous_blocks = 0
         match_found = False
         # Search from right to left and early stop when a match is found.
@@ -442,6 +512,10 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
                     break
             else:
                 num_contiguous_blocks = 0
+        # print(f"{computed_blocks=}")
+        # print(f"{match_found=}")
+        # print(f"{alignment_tokens=}")
+        # print(60*"*")
         if not match_found:
             # The first `num_contiguous_blocks` is a cache hit even if
             # `num_contiguous_blocks < sliding_window_contiguous_blocks`.
@@ -498,6 +572,41 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         """
         return 0
 
+    def remove_skipped_blocks(self, request_id: str, num_computed_tokens: int) -> None:
+        """
+        Remove and free the blocks that are no longer needed for attention computation.
+        The removed blocks should be replaced by null_block.
+
+        This function depends on `get_num_skipped_tokens`, which need to be implemented
+        differently for each attention type.
+
+        Args:
+            request_id: The request ID.
+            num_computed_tokens: The number of tokens that have been computed.
+        """
+        # Remove the blocks that will be skipped during attention computation.
+        num_skipped_tokens = self.get_num_skipped_tokens(num_computed_tokens)
+        if num_skipped_tokens <= 0:
+            # This indicates that ALL tokens are inside attention window.
+            # Thus we do not need to free any blocks outside attention window.
+            # A typical case is full attention that we never free any token
+            # before the request is finished.
+            return
+        self.block_size = 128 * 128
+        num_skipped_blocks = num_skipped_tokens // self.block_size
+        blocks = self.req_to_blocks[request_id]
+        removed_blocks: list[KVCacheBlock] = []
+        # Because the block starts from index 0, the num_skipped_block-th block
+        # corresponds to index num_skipped_blocks - 1.
+        for i in range(num_skipped_blocks - 1, -1, -1):
+            if blocks[i] == self._null_block:
+                # If the block is already a null block, the blocks before it
+                # should also have been set to null blocks by the previous calls
+                # to this function.
+                break
+            removed_blocks.append(blocks[i])
+            blocks[i] = self._null_block
+        self.block_pool.free_blocks(removed_blocks)
 
 class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
     def __init__(

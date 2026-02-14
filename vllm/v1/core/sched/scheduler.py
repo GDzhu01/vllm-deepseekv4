@@ -217,7 +217,6 @@ class Scheduler(SchedulerInterface):
                             "compress_ratios")
         if self.use_compress:
             self.compress_ratio = max(self.vllm_config.model_config.hf_config.compress_ratios)
-            print(f"{self.compress_ratio=}")
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
