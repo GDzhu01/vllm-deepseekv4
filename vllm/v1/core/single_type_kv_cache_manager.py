@@ -382,7 +382,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         # TODO NOTE(cmq): This only address the issue that num_blocks is too large to request
         #  a long sequence, but introduce an issue that prefix caching is broken.
         # see BlockHashListWithBlockSize for more details.
-        num_tokens = cdiv(num_tokens, 128 * 128 // self.kv_cache_spec.block_size)        
+        num_tokens = cdiv(num_tokens, 8)        
         # (cdiv(num_tokens, 128 * 128) + 1)
 
         return super().get_num_blocks_to_allocate(request_id, num_tokens,
@@ -405,7 +405,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         # TODO NOTE(cmq): This only address the issue that num_blocks is too large to request
         #  a long sequence, but introduce an issue that prefix caching is broken.
         # see BlockHashListWithBlockSize for more details.
-        num_tokens = cdiv(num_tokens, 128 * 128 // self.kv_cache_spec.block_size)        
+        num_tokens = cdiv(num_tokens, 8)        
 
         req_blocks = self.req_to_blocks[request_id]
         num_required_blocks = cdiv(num_tokens, self.block_size)
@@ -430,7 +430,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         # TODO NOTE(cmq): This only address the issue that num_blocks is too large to request
         #  a long sequence, but introduce an issue that prefix caching is broken.
         # see BlockHashListWithBlockSize for more details.
-        num_tokens = cdiv(num_tokens, 128 * 128 // self.kv_cache_spec.block_size)        
+        num_tokens = cdiv(num_tokens, 8)        
 
         return super().cache_blocks(request, num_tokens)
 
@@ -592,8 +592,8 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             # A typical case is full attention that we never free any token
             # before the request is finished.
             return
-        self.block_size = 128 * 128
-        num_skipped_blocks = num_skipped_tokens // self.block_size
+        # self.block_size = 128 * 128
+        num_skipped_blocks = num_skipped_tokens // (self.block_size * 8)
         blocks = self.req_to_blocks[request_id]
         removed_blocks: list[KVCacheBlock] = []
         # Because the block starts from index 0, the num_skipped_block-th block
