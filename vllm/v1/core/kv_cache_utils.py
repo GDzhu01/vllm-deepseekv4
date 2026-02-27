@@ -845,7 +845,14 @@ def get_num_blocks(
         page_size: The page size of the KV cache.
     """
     # TODO(lxs): 考虑同一层有多个spec情况下，最后num_blocks太少的情况
+    print(60*"-")
+    print(f"{available_memory=}")
+    print(f"{page_size=}")
+    print(f"{num_layers=}")
+    
+
     num_blocks = int(available_memory // page_size // num_layers)
+    print(f"{num_blocks=}")
     num_blocks = max(num_blocks, 0)
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
     return num_blocks
