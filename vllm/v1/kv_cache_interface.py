@@ -550,7 +550,8 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
             return all(
                 isinstance(spec, MLAAttentionSpec) for spec in kv_cache_specs.values()
             )
-        elif isinstance(one_spec, FullAttentionSpec):            return all(
+        elif isinstance(one_spec, FullAttentionSpec):
+            return all(
                 isinstance(spec, FullAttentionSpec) for spec in kv_cache_specs.values()
             )
         elif isinstance(one_spec, CrossAttentionSpec):
