@@ -15,6 +15,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.worker.utils import AttentionGroup, bind_kv_cache
 
 
@@ -138,9 +139,29 @@ def _reshape_kv_cache(
             ]
 
             dtype = kv_cache_spec.dtype
-            raw_tensor = raw_tensor.view(dtype)
-            raw_tensor = raw_tensor.view(kv_cache_shape)
-            kv_caches[layer_name] = raw_tensor.permute(*inv_order)
+            if kv_cache_spec.page_size_padded is not None:
+                # Use strided view to handle page_size_bytes that
+                # include padding. This follows the same pattern as
+                # MambaSpec handling in gpu_model_runner.py.
+                # NOTE: This assumes kv_cache_shape[0] == num_blocks
+                # (i.e. the first physical dimension is the block
+                # index), which holds for MLA backends but NOT for
+                # standard attention backends whose shape starts with
+                # a K/V dimension of size 2.
+                dtype_size = get_dtype_size(dtype)
+                page_stride = kv_cache_spec.page_size_bytes // dtype_size
+                strides = list(torch.empty(kv_cache_shape).stride())
+                strides[inv_order[0]] = page_stride
+                kv_cache = torch.as_strided(
+                    raw_tensor,
+                    size=kv_cache_shape,
+                    stride=tuple(strides),
+                )
+            else:
+                # No padding — safe to use a contiguous view.
+                kv_cache = raw_tensor.view(kv_cache_shape)
+            kv_caches[layer_name] = kv_cache.permute(*inv_order)
+
     return kv_caches
 
 

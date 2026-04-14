@@ -112,6 +112,19 @@ class CacheConfig:
     - "align": only cache the mamba state of the last token of each scheduler step and
            when the token is at position i * block_size.
     """
+    hash_block_size: SkipValidation[int] | None = None  # type: ignore
+    """Block size (in tokens) used for computing Request's block_hashes.
+
+    This can be set to a finer granularity than the physical KV cache block
+    sizes (e.g. 8) as long as every KV cache group's `block_size` is divisible
+    by it. This enables prefix-caching keys to be computed at the finest common
+    granularity and then merged for larger physical block sizes.
+
+    This config is not static default. If left unspecified, vLLM will choose a
+    default based on the resolved KV cache groups (typically the smallest KV
+    cache block size when there are multiple groups).
+    """
+
 
     # Will be set after profiling.
     num_gpu_blocks: int | None = field(default=None, init=False)
@@ -168,6 +181,8 @@ class CacheConfig:
             "num_gpu_blocks_override",
             "enable_prefix_caching",
             "prefix_caching_hash_algo",
+            # Prefix-caching implementation detail (doesn't affect compiled graph).
+            "hash_block_size",
             "cpu_kvcache_space_bytes",
             "mamba_page_size_padded",
             "user_specified_block_size",

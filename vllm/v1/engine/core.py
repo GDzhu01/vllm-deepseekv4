@@ -14,6 +14,7 @@ from functools import partial
 from inspect import isclass, signature
 from logging import DEBUG
 from typing import Any, TypeVar, cast
+from math import lcm
 
 import msgspec
 import zmq
@@ -132,11 +133,29 @@ class EngineCore:
                 logger.warning("Disabling chunked prefill for model without KVCache")
                 vllm_config.scheduler_config.enable_chunked_prefill = False
 
-        scheduler_block_size = (
-            vllm_config.cache_config.block_size
-            * vllm_config.parallel_config.decode_context_parallel_size
-            * vllm_config.parallel_config.prefill_context_parallel_size
-        )
+        # Scheduler block_size is used for token-alignment invariants (e.g.
+        # num_computed_tokens alignment). For a single KV cache group, this is
+        # the cache block size adjusted by context parallelism. For multiple KV
+        # cache groups with different physical block sizes, this should be the
+        # LCM of all group block sizes (hybrid path).
+        if len(kv_cache_config.kv_cache_groups) > 1:
+            dcp = vllm_config.parallel_config.decode_context_parallel_size
+            pcp = vllm_config.parallel_config.prefill_context_parallel_size
+            if dcp != 1 or pcp != 1:
+                raise ValueError(
+                    "Hybrid KV cache groups with multiple block sizes do not "
+                    "support context parallelism (dcp_world_size/pcp_world_size > 1)."
+                )
+            group_block_sizes = [
+                g.kv_cache_spec.block_size for g in kv_cache_config.kv_cache_groups
+            ]
+            scheduler_block_size = lcm(*group_block_sizes)
+        else:
+            scheduler_block_size = (
+                vllm_config.cache_config.block_size
+                * vllm_config.parallel_config.decode_context_parallel_size
+                * vllm_config.parallel_config.prefill_context_parallel_size
+            )
 
         self.scheduler: SchedulerInterface = Scheduler(
             vllm_config=vllm_config,
@@ -202,8 +221,11 @@ class EngineCore:
             init_none_hash(caching_hash_fn)
 
             self.request_block_hasher = get_request_block_hasher(
-                scheduler_block_size, caching_hash_fn
-            )
+                # Hash at the resolved finest granularity (may differ from the
+                # scheduler alignment block size in hybrid mode).
+                self.scheduler.hash_block_size,
+                caching_hash_fn,
+                )
 
         self.step_fn = (
             self.step if self.batch_queue is None else self.step_with_batch_queue
