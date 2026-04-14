@@ -258,8 +258,7 @@ class AttentionGroup:
 
 
 def select_common_block_size(
-    kv_manager_block_size: int,
-    backends: list[type[AttentionBackend]],
+    kv_manager_block_size: int, attn_groups: list[AttentionGroup]
 ) -> int:
     """
     Select a block size that is supported by all backends and is a factor of
@@ -269,20 +268,22 @@ def select_common_block_size(
     Otherwise, return the max supported size.
 
     Args:
-        kv_manager_block_size: Block size of KV cache.
-        backends: List of attention backend classes.
+        kv_manager_block_size: Block size of KV cache
+        attn_groups: List of attention groups
 
     Returns:
-        The selected block size.
+        The selected block size
 
     Raises:
-        ValueError: If no valid block size found.
+        ValueError: If no valid block size found
     """
 
     def block_size_is_supported(
         backends: list[type[AttentionBackend]], block_size: int
     ) -> bool:
-        """Check if the block size is supported by all backends."""
+        """
+        Check if the block size is supported by all backends.
+        """
         for backend in backends:
             is_supported = False
             for supported_size in backend.get_supported_kernel_block_sizes():
@@ -298,8 +299,10 @@ def select_common_block_size(
                 return False
         return True
 
+    backends = [group.backend for group in attn_groups]
+
     # Case 1: if the block_size of kv cache manager is supported by all backends,
-    # return it directly.
+    # return it directly
     if block_size_is_supported(backends, kv_manager_block_size):
         return kv_manager_block_size
 
