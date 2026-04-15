@@ -243,6 +243,7 @@ class DefaultMoERunner(MoERunner):
         shared_input: torch.Tensor | None,
         has_separate_shared_experts: bool,
         use_chunked_impl: bool,
+        input_ids: torch.Tensor | None = None,
     ) -> tuple[bool, torch.Tensor | None]:
         use_shared_experts_stream = (
             current_platform.is_cuda()
@@ -592,6 +593,7 @@ class DefaultMoERunner(MoERunner):
         layer: torch.nn.Module,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None,
         shared_input: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         assert self.quant_method is not None

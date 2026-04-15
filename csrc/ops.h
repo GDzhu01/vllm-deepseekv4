@@ -145,7 +145,8 @@ void rms_norm_per_block_quant(torch::Tensor& out, torch::Tensor const& input,
 
 void rotary_embedding(torch::Tensor& positions, torch::Tensor& query,
                       std::optional<torch::Tensor> key, int64_t head_size,
-                      torch::Tensor& cos_sin_cache, bool is_neox);
+                      torch::Tensor& cos_sin_cache, bool is_neox,
+                      int64_t rope_dim_offset, bool inverse);
 
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 

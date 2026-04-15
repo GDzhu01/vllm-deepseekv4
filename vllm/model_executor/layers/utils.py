@@ -299,6 +299,26 @@ def cpu_unquantized_gemm(
     return layer.cpu_linear(x, weight, bias)
 
 
+def deep_gemm_cublaslt_gemm(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+):
+    from vllm.utils.deep_gemm import cublaslt_gemm_nt
+
+    m, _ = x.shape
+    n, _ = weight.shape
+    out = torch.empty(m, n, dtype=layer.out_dtype, device=x.device)
+    cublaslt_gemm_nt(
+        a=x,
+        b=weight,
+        d=out,
+        c=None,
+    )
+    return out
+
+
 def dispatch_unquantized_gemm() -> Callable[..., torch.Tensor]:
     if current_platform.is_rocm():
         return rocm_unquantized_gemm

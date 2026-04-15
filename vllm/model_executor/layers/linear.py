@@ -26,6 +26,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from vllm.model_executor.layers.utils import (
+    deep_gemm_cublaslt_gemm,
     dispatch_unquantized_gemm,
 )
 from vllm.model_executor.parameter import (
@@ -225,6 +226,13 @@ class UnquantizedLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         if vllm_is_batch_invariant() and current_platform.is_cuda_alike():
             return linear_batch_invariant(x, layer.weight, bias)
+        if layer.params_dtype != layer.out_dtype:
+            assert bias is None, (
+                "Bias is not supported when params_dtype and out_dtype are not the same"
+            )
+            assert current_platform.is_cuda()
+            return deep_gemm_cublaslt_gemm(layer, x, layer.weight, bias)
+
         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
 
 
@@ -248,6 +256,7 @@ class LinearBase(PluggableLayer):
         output_size: int,
         skip_bias_add: bool = False,
         params_dtype: torch.dtype | None = None,
+        out_dtype: torch.dtype | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         *,
@@ -263,6 +272,7 @@ class LinearBase(PluggableLayer):
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
         self.params_dtype = params_dtype
+        self.out_dtype = out_dtype if out_dtype is not None else params_dtype
         self.quant_config = quant_config
         self.prefix = prefix
         self.allow_fp8_block_shape_mismatch = False
@@ -309,6 +319,7 @@ class ReplicatedLinear(LinearBase):
         bias: bool = True,
         skip_bias_add: bool = False,
         params_dtype: torch.dtype | None = None,
+        out_dtype: torch.dtype | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         *,
@@ -326,6 +337,7 @@ class ReplicatedLinear(LinearBase):
             output_size,
             skip_bias_add,
             params_dtype,
+            out_dtype,
             quant_config,
             prefix=prefix,
             return_bias=return_bias,
@@ -438,6 +450,7 @@ class ColumnParallelLinear(LinearBase):
         gather_output: bool = False,
         skip_bias_add: bool = False,
         params_dtype: torch.dtype | None = None,
+        out_dtype: torch.dtype | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         *,
@@ -461,6 +474,7 @@ class ColumnParallelLinear(LinearBase):
             output_size,
             skip_bias_add,
             params_dtype,
+            out_dtype,
             quant_config,
             prefix,
             return_bias=return_bias,
@@ -635,6 +649,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         gather_output: bool = False,
         skip_bias_add: bool = False,
         params_dtype: torch.dtype | None = None,
+        out_dtype: torch.dtype | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         *,
@@ -653,6 +668,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             gather_output=gather_output,
             skip_bias_add=skip_bias_add,
             params_dtype=params_dtype,
+            out_dtype=out_dtype,
             quant_config=quant_config,
             prefix=prefix,
             return_bias=return_bias,
@@ -985,6 +1001,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         bias: bool = True,
         skip_bias_add: bool = False,
         params_dtype: torch.dtype | None = None,
+        out_dtype: torch.dtype | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         *,
@@ -1027,6 +1044,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             gather_output=False,
             skip_bias_add=skip_bias_add,
             params_dtype=params_dtype,
+            out_dtype=out_dtype,
             quant_config=quant_config,
             prefix=prefix,
             return_bias=return_bias,
@@ -1390,6 +1408,7 @@ class RowParallelLinear(LinearBase):
         input_is_parallel: bool = True,
         skip_bias_add: bool = False,
         params_dtype: torch.dtype | None = None,
+        out_dtype: torch.dtype | None = None,
         reduce_results: bool = True,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -1409,6 +1428,7 @@ class RowParallelLinear(LinearBase):
             output_size,
             skip_bias_add,
             params_dtype,
+            out_dtype,
             quant_config,
             prefix,
             return_bias=return_bias,

@@ -115,6 +115,7 @@ class KVCacheManager:
         enable_kv_cache_events: bool = False,
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
+        eagle_attn_layer_names: list[str] | None = None,
         metrics_collector: KVCacheMetricsCollector | None = None,
     ) -> None:
         self.max_model_len = max_model_len
@@ -137,6 +138,7 @@ class KVCacheManager:
             dcp_world_size=dcp_world_size,
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
+            eagle_attn_layer_names=eagle_attn_layer_names,
             metrics_collector=self.metrics_collector,
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)

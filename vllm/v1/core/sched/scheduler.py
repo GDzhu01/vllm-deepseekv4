@@ -30,6 +30,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsReader,
 )
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.v1.core.encoder_cache_manager import (
@@ -152,6 +153,7 @@ class Scheduler(SchedulerInterface):
         self.block_size = block_size
         self.dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
         self.pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
+        self.hash_block_size = self._resolve_hash_block_size(kv_cache_config)
 
         # req_id -> Request
         self.requests: dict[str, Request] = {}
@@ -221,6 +223,10 @@ class Scheduler(SchedulerInterface):
             if speculative_config.uses_draft_model():
                 self.num_lookahead_tokens = self.num_spec_tokens
 
+        eagle_attn_layer_names = self._find_eagle_attn_layer_names(
+            kv_cache_config, vllm_config
+        )
+
         # Create the KV cache manager.
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
@@ -231,7 +237,8 @@ class Scheduler(SchedulerInterface):
             enable_kv_cache_events=self.enable_kv_cache_events,
             dcp_world_size=self.dcp_world_size,
             pcp_world_size=self.pcp_world_size,
-            hash_block_size=self.block_size,
+            hash_block_size=self.hash_block_size,
+            eagle_attn_layer_names=eagle_attn_layer_names,
             metrics_collector=self.kv_metrics_collector,
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
@@ -334,6 +341,76 @@ class Scheduler(SchedulerInterface):
                 # prefill the last few tokens
                 pass
         return num_new_tokens
+
+    @staticmethod
+    def _find_eagle_attn_layer_names(
+        kv_cache_config: KVCacheConfig,
+        vllm_config: VllmConfig,
+    ) -> list[str] | None:
+        """Identify EAGLE/MTP attention layer names in the KV cache groups.
+
+        MTP layers use layer indices >= num_hidden_layers (e.g.
+        ``model.layers.43.mtp_block.attn.swa_cache`` for a model with 43
+        hidden layers).  Returns ``None`` when EAGLE is not in use.
+        """
+        spec_config = vllm_config.speculative_config
+        if spec_config is None or not spec_config.use_eagle():
+            return None
+
+        num_hidden = getattr(
+            vllm_config.model_config.hf_config, "num_hidden_layers", None
+        )
+        if num_hidden is None:
+            return None
+
+        eagle_names: list[str] = []
+        for group in kv_cache_config.kv_cache_groups:
+            for name in group.layer_names:
+                if extract_layer_index(name) >= num_hidden:
+                    eagle_names.append(name)
+        return eagle_names or None
+
+    def _resolve_hash_block_size(self, kv_cache_config: KVCacheConfig) -> int:
+        """Resolve the block size used to compute `Request.block_hashes`.
+
+        - For a single KV cache group, we keep hash_block_size == scheduler
+          block_size to preserve existing assumptions in the unitary
+          prefix-caching path.
+        - For multiple KV cache groups, we allow hashing at a finer granularity
+          (e.g. 8) as long as every group's physical block size is divisible by
+          it. This enables hash merging for larger blocks.
+        """
+        kv_cache_groups = kv_cache_config.kv_cache_groups
+        if len(kv_cache_groups) <= 1:
+            return self.block_size
+
+        # Block hashes are only computed when prefix caching is enabled or a
+        # KV connector (P/D, offloading) is active.  When neither is true the
+        # divisibility constraint is irrelevant — return the scheduler
+        # block_size to match the single-group path.
+        needs_hashing = (
+            self.cache_config.enable_prefix_caching or self.connector is not None
+        )
+        if not needs_hashing:
+            return self.block_size
+
+        # Hybrid KV cache currently does not support context parallelism.
+        if self.dcp_world_size != 1 or self.pcp_world_size != 1:
+            raise ValueError(
+                "Hybrid KV cache groups with multiple block sizes do not "
+                "support context parallelism (dcp_world_size/pcp_world_size > 1)."
+            )
+
+        group_block_sizes = [g.kv_cache_spec.block_size for g in kv_cache_groups]
+        requested = self.cache_config.hash_block_size
+        hash_block_size = requested if requested is not None else min(group_block_sizes)
+        if any(bs % hash_block_size != 0 for bs in group_block_sizes):
+            raise ValueError(
+                f"Invalid hash_block_size={hash_block_size}; all KV cache group "
+                f"block sizes must be divisible by hash_block_size. "
+                f"Got group block sizes={group_block_sizes}."
+            )
+        return hash_block_size
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:

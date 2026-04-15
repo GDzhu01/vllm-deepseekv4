@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import copy
+from collections import Counter
 from dataclasses import dataclass, fields, replace
 from math import prod
 
@@ -10,8 +11,12 @@ from typing_extensions import Self
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.utils.math_utils import cdiv
+from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.torch_utils import get_dtype_size
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+
 
 logger = init_logger(__name__)
 
@@ -34,6 +39,10 @@ class KVCacheSpec:
             The page size
         """
         raise NotImplementedError
+
+    @property
+    def storage_block_size(self) -> int:
+        return self.block_size
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         """
@@ -187,19 +196,78 @@ class FullAttentionSpec(AttentionSpec):
         )
 
 
+def _init_mla_cache_fields(spec: MLAAttentionSpec | SlidingWindowMLASpec):
+    """Shared MLA cache init logic for quantiztion format across different models."""
+    FP8_DTYPE = "fp8_ds_mla"
+    MODEL_VERSIONS = ["v32", "svf"]
+    if spec.cache_dtype_str != FP8_DTYPE:
+        return
+    assert spec.model_version in MODEL_VERSIONS, "Invalid model version."
+    assert (spec.model_version == "v32" and spec.compress_ratio == 1) or (
+        spec.model_version == "svf" and spec.compress_ratio in [1, 4, 128]
+    ), "Invalid compress ratio."
+    if spec.compress_ratio > 1:
+        assert spec.block_size % spec.compress_ratio == 0, (
+            f"Block size {spec.block_size} must be divisible by compress ratio."
+        )
+
+    # See `vllm/v1/attention/backends/mla/flashmla_sparse.py`
+    #  for details.
+    assert spec.num_kv_heads == 1, "MLAAttentionSpec only supports 1 head."
+    # TODO(yifan): move this head size to bytes mapping to a utils file.
+    if spec.model_version == "v32":
+        # V3.2: 512B NoPE + 64*2B FP16 RoPE + 4*4B FP32 scale = 656B
+        # head_size = kv_lora_rank(512) + qk_rope_head_dim(64) = 576
+        if spec.head_size == 576:
+            object.__setattr__(spec, "head_size", 656)
+            object.__setattr__(spec, "head_size_v", 656)
+        elif spec.head_size != 656:
+            raise ValueError(f"Invalid head size for V3.2: {spec.head_size}")
+    elif spec.model_version == "svf":
+        HEAD_DIM_TO_BLOCK_BYTES: dict[int, int] = {
+            128: 132,  # SVF: 128B NoPE, 4B for fp32 scale = 132B
+            512: 584,  # SVF: 448B NoPE, 128B RoPE, 8B for fp8 scale = 584B
+        }
+
+        if spec.head_size in HEAD_DIM_TO_BLOCK_BYTES:
+            actual_head_bytes = HEAD_DIM_TO_BLOCK_BYTES[spec.head_size]
+            object.__setattr__(spec, "head_size", actual_head_bytes)
+            object.__setattr__(spec, "head_size_v", actual_head_bytes)
+        elif spec.head_size not in HEAD_DIM_TO_BLOCK_BYTES.values():
+            raise ValueError(f"Invalid head size: {spec.head_size}.")
+
+        if spec.alignment is not None:
+            # Apply 576-byte alignment padding for SVF 512.
+            # KV cache tensor is allocated with padded page_size,
+            # but kernels access with shape [num_blocks, real_page_size].
+            actual_page_size = spec.real_page_size_bytes
+            padded_page_size = round_up(actual_page_size, spec.alignment)
+            if padded_page_size != actual_page_size:
+                object.__setattr__(spec, "page_size_padded", padded_page_size)
+    else:
+        raise ValueError(f"Invalid model version: {spec.model_version}")
+
+
 @dataclass(frozen=True, kw_only=True)
 class MLAAttentionSpec(FullAttentionSpec):
     # TODO(Lucas/Chen): less hacky way to do this
     cache_dtype_str: str | None = None
+    alignment: int | None = None  # Default to None for no padding.
+    compress_ratio: int = 1  # Default to 1 for no compression.
+    model_version: str = "v32"  # NOTE(yifan): for SVF support.
+
+    def __post_init__(self):
+        super().__post_init__()
+        _init_mla_cache_fields(self)
+
+    @property
+    def storage_block_size(self) -> int:
+        return self.block_size // self.compress_ratio
 
     @property
     def real_page_size_bytes(self) -> int:
-        if self.cache_dtype_str == "fp8_ds_mla":
-            # See `vllm/v1/attention/backends/mla/flashmla_sparse.py`
-            #  for details.
-            return self.block_size * 656
         return (
-            self.block_size
+            self.storage_block_size
             * self.num_kv_heads
             * self.head_size
             * get_dtype_size(self.dtype)
@@ -211,9 +279,15 @@ class MLAAttentionSpec(FullAttentionSpec):
             "All attention layers in the same KV cache group must be MLAAttentionSpec."
         )
         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
-        assert len(cache_dtype_str_set) == 1, (
+        compress_ratio_set = set(spec.compress_ratio for spec in specs)
+        model_version_set = set(spec.model_version for spec in specs)
+        assert (
+            len(cache_dtype_str_set) == 1
+            and len(compress_ratio_set) == 1
+            and len(model_version_set) == 1
+        ), (
             "All attention layers in the same KV cache group must use the same "
-            "quantization method."
+            "quantization method, compress ratio and model version."
         )
         return cls(
             block_size=specs[0].block_size,
@@ -222,6 +296,8 @@ class MLAAttentionSpec(FullAttentionSpec):
             dtype=specs[0].dtype,
             page_size_padded=specs[0].page_size_padded,
             cache_dtype_str=cache_dtype_str_set.pop(),
+            compress_ratio=compress_ratio_set.pop(),
+            model_version=model_version_set.pop(),
         )
 
 
@@ -268,6 +344,64 @@ class SlidingWindowSpec(AttentionSpec):
         # is 4, we need two blocks [XXCD] [EF] to store the sliding
         # window [CDEF] of 6 tokens.
         return (cdiv(num_tokens, self.block_size) + 1) * self.page_size_bytes
+
+
+@dataclass(frozen=True, kw_only=True)
+class SlidingWindowMLASpec(SlidingWindowSpec):
+    """Sliding window attention with MLA cache format."""
+
+    cache_dtype_str: str | None = None
+    alignment: int | None = None  # Default to None for no padding.
+    compress_ratio: int = 1
+    model_version: str = "svf"
+
+    def __post_init__(self):
+        _init_mla_cache_fields(self)
+
+    @property
+    def storage_block_size(self) -> int:
+        return self.block_size // self.compress_ratio
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        return (
+            self.storage_block_size
+            * self.num_kv_heads
+            * self.head_size
+            * get_dtype_size(self.dtype)
+        )
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        assert all(isinstance(spec, SlidingWindowMLASpec) for spec in specs), (
+            "All attention layers in the same KV cache group must be "
+            "SlidingWindowMLASpec."
+        )
+        cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
+        compress_ratio_set = set(spec.compress_ratio for spec in specs)
+        model_version_set = set(spec.model_version for spec in specs)
+        sliding_window_set = set(spec.sliding_window for spec in specs)
+        assert (
+            len(cache_dtype_str_set) == 1
+            and len(compress_ratio_set) == 1
+            and len(model_version_set) == 1
+            and len(sliding_window_set) == 1
+        ), (
+            "All attention layers in the same KV cache group must use the same "
+            "quantization method, compress ratio, model version and sliding "
+            "window size."
+        )
+        return cls(
+            block_size=specs[0].block_size,
+            num_kv_heads=specs[0].num_kv_heads,
+            head_size=specs[0].head_size,
+            dtype=specs[0].dtype,
+            page_size_padded=specs[0].page_size_padded,
+            sliding_window=sliding_window_set.pop(),
+            cache_dtype_str=cache_dtype_str_set.pop(),
+            compress_ratio=compress_ratio_set.pop(),
+            model_version=model_version_set.pop(),
+        )
 
 
 @dataclass(frozen=True)
@@ -403,7 +537,23 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
             # Different block sizes, not uniform.
             return False
         one_spec = next(iter(kv_cache_specs.values()))
-        if isinstance(one_spec, FullAttentionSpec):
+        # NOTE: Check subclasses before parent classes since isinstance()
+        # returns True for subclasses.
+        if isinstance(one_spec, SlidingWindowMLASpec):
+            # SlidingWindowMLASpec is uniform if all specs are SlidingWindowMLASpec
+            # with the same sliding_window size.
+            return all(
+                isinstance(spec, SlidingWindowMLASpec)
+                and spec.sliding_window == one_spec.sliding_window
+                for spec in kv_cache_specs.values()
+            )
+        elif isinstance(one_spec, MLAAttentionSpec):
+            # MLAAttentionSpec is uniform if all specs are MLAAttentionSpec.
+            # Different compress_ratio and page_size are allowed.
+            return all(
+                isinstance(spec, MLAAttentionSpec) for spec in kv_cache_specs.values()
+            )
+        elif isinstance(one_spec, FullAttentionSpec):
             return all(
                 isinstance(spec, FullAttentionSpec) for spec in kv_cache_specs.values()
             )
@@ -446,6 +596,21 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
             return cls(block_size=block_size, kv_cache_specs=kv_cache_specs)
         else:
             return None
+
+    # NOTE: below util functions are only used by SVF for now.
+    def get_page_sizes(self) -> list[int]:
+        return list(set(spec.page_size_bytes for spec in self.kv_cache_specs.values()))
+
+    def get_num_layer_tuples(self) -> int:
+        return Counter(
+            spec.page_size_bytes for spec in self.kv_cache_specs.values()
+        ).most_common(1)[0][1]
+
+    def max_memory_usage_pages(self, vllm_config: VllmConfig) -> int:
+        return max(
+            cdiv(spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes)
+            for spec in self.kv_cache_specs.values()
+        )
 
 
 @dataclass

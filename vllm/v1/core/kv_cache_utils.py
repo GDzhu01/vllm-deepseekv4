@@ -15,7 +15,7 @@ from vllm import envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.hashing import sha256_cbor, xxhash_cbor
-from vllm.utils.math_utils import cdiv
+from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import format_gib
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
@@ -24,6 +24,8 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     KVCacheTensor,
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -1119,6 +1121,54 @@ def get_kv_cache_config_from_groups(
             )
             for layer_name in kv_cache_groups[0].layer_names
         ]
+    elif all(
+        isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        for group in kv_cache_groups
+    ):
+        # Special case (only SVF for now): all groups are UniformTypeKVCacheSpecs.
+        # They must already be page_size aligned and #(layer_tuples) aligned.
+        # Here we allocate one KV cache tensor per (layer_tuple, page_size) "slot".
+        # Layers across groups with the same page size at the same tuple index share
+        # the same backing tensor.
+        full_mla_group = kv_cache_groups[0]
+        page_sizes_in_tuple = sorted(full_mla_group.kv_cache_spec.get_page_sizes())
+        layer_tuple_page_bytes = sum(page_sizes_in_tuple)
+
+        # Precompute per-group metadata once.
+        # - tuple_size: how many layers are in one "layer tuple" for this group
+        #              (equals the number of unique page sizes in the group).
+        # - layer_page_sizes: page_size per layer in the group's layer_names order.
+        group_meta: list[tuple[int, list[str], list[int]]] = []
+        num_layer_tuples = 0
+        for group in kv_cache_groups:
+            assert isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+            specs = group.kv_cache_spec.kv_cache_specs
+            tuple_size = len({spec.page_size_bytes for spec in specs.values()})
+            layer_names = group.layer_names
+            layer_page_sizes = [specs[name].page_size_bytes for name in layer_names]
+            group_meta.append((tuple_size, layer_names, layer_page_sizes))
+            num_layer_tuples = max(num_layer_tuples, cdiv(len(layer_names), tuple_size))
+        # Compute blocks using the final `num_layer_tuples` (important for correctness).
+        num_blocks = available_memory // (layer_tuple_page_bytes * num_layer_tuples)
+        num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+
+        page_size_to_bucket = {ps: idx for idx, ps in enumerate(page_sizes_in_tuple)}
+        kv_cache_tensors = []
+        for tuple_idx in range(num_layer_tuples):
+            shared_by_buckets: list[list[str]] = [[] for _ in page_sizes_in_tuple]
+            for tuple_size, layer_names, layer_page_sizes in group_meta:
+                start = tuple_idx * tuple_size
+                end = min(start + tuple_size, len(layer_names))
+                for layer_idx in range(start, end):
+                    ps = layer_page_sizes[layer_idx]
+                    bucket = page_size_to_bucket.get(ps)
+                    assert bucket is not None
+                    shared_by_buckets[bucket].append(layer_names[layer_idx])
+
+            for ps, shared_by in zip(page_sizes_in_tuple, shared_by_buckets):
+                kv_cache_tensors.append(
+                    KVCacheTensor(size=ps * num_blocks, shared_by=shared_by)
+                )
     else:
         # General case:
         # We will have group_size memory pools, each is shared by one layer from
@@ -1185,9 +1235,41 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
     has_chunked_local_attention = any(
         isinstance(spec, ChunkedLocalAttentionSpec) for spec in kv_cache_spec.values()
     )
+    has_swa_mla = any(
+        isinstance(spec, SlidingWindowMLASpec) for spec in kv_cache_spec.values()
+    )
+
+    uniform_block_size: int | None = None
+    if has_swa_mla:
+        # For SVF, block sizes can be different for different KV cache groups.
+        # E.g., Full MLA: 256; SWA MLA: 64; C4 partial states: 4, C128 states: 8.
+        assert has_full_attention
+        any_full_spec = next(
+            iter(
+                spec
+                for spec in kv_cache_spec.values()
+                if isinstance(spec, FullAttentionSpec)
+            )
+        )
+        uniform_block_size = any_full_spec.block_size
+
     if has_full_attention and (has_sliding_window or has_chunked_local_attention):
         for layer_name, spec in kv_cache_spec.items():
-            if isinstance(spec, SlidingWindowSpec):
+            if isinstance(spec, SlidingWindowMLASpec):
+                kv_cache_spec[layer_name] = MLAAttentionSpec(
+                    block_size=uniform_block_size
+                    if uniform_block_size is not None
+                    else spec.block_size,
+                    num_kv_heads=spec.num_kv_heads,
+                    head_size=spec.head_size,
+                    dtype=spec.dtype,
+                    page_size_padded=spec.page_size_padded,
+                    cache_dtype_str=spec.cache_dtype_str,
+                    alignment=spec.alignment,
+                    compress_ratio=spec.compress_ratio,
+                    model_version=spec.model_version,
+                )
+            elif isinstance(spec, SlidingWindowSpec):
                 kv_cache_spec[layer_name] = FullAttentionSpec(
                     block_size=spec.block_size,
                     num_kv_heads=spec.num_kv_heads,
@@ -1214,6 +1296,179 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
             "Hybrid KV cache manager is disabled but failed to "
             "convert the KV cache specs to one unified type."
         )
+
+
+def group_and_unify_kv_cache_specs(
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[UniformTypeKVCacheSpecs] | None:
+    """
+    Group the KV cache specs and unify each group into one UniformTypeKVCacheSpecs.
+    Currently, this is only used for SVF.
+    """
+    if not any(
+        isinstance(spec, SlidingWindowMLASpec) for spec in kv_cache_spec.values()
+    ):
+        return None
+
+    mla_specs: dict[str, KVCacheSpec] = {}
+    grouped_swa_mla_specs: dict[tuple[int, int], dict[str, KVCacheSpec]] = defaultdict(
+        dict
+    )
+    for name, spec in kv_cache_spec.items():
+        if isinstance(spec, SlidingWindowMLASpec):
+            grouped_swa_mla_specs[(spec.block_size, spec.sliding_window)][name] = spec
+        elif isinstance(spec, MLAAttentionSpec):
+            mla_specs[name] = spec
+
+    assert len(mla_specs) > 0
+    mla_uniform_spec = UniformTypeKVCacheSpecs.from_specs(mla_specs)
+    assert mla_uniform_spec is not None
+
+    swa_uniform_specs: list[UniformTypeKVCacheSpecs] = []
+    for spec_dict in grouped_swa_mla_specs.values():
+        uniform_spec = UniformTypeKVCacheSpecs.from_specs(spec_dict)
+        assert uniform_spec is not None
+        swa_uniform_specs.append(uniform_spec)
+
+    return [mla_uniform_spec, *swa_uniform_specs]
+
+
+def approximate_gcd(values: Sequence[int], *, lower_bound: int | None = None) -> int:
+    """Pick a chunk size that minimizes total upward padding.
+
+    Each x is rounded up to a multiple of d:
+
+      x -> ceil(x / d) * d
+
+    Total padding is:
+
+      pad(d) = sum_i (ceil(x_i / d) * d - x_i)
+
+    We brute-force d in [lower_bound, max(values)] (fine for small lists / small
+    maxima) and return the d with minimum padding. Ties prefer larger d.
+    """
+    if not values:
+        raise ValueError("values must be non-empty")
+    if any(x <= 0 for x in values):
+        raise ValueError(f"values must be positive, got: {list(values)!r}")
+
+    min_d = max(1, lower_bound if lower_bound is not None else 1)
+    max_d = max(values)
+    if min_d > max_d:
+        return min_d
+
+    best_d = min_d
+    best_pad: int | None = None
+    for d in range(min_d, max_d + 1):
+        pad = sum((d - (x % d)) % d for x in values)
+        if best_pad is None or pad < best_pad or (pad == best_pad and d > best_d):
+            best_pad = pad
+            best_d = d
+
+    return best_d
+
+
+def _get_kv_cache_groups_uniform_groups(
+    grouped_specs: list[UniformTypeKVCacheSpecs],
+) -> list[KVCacheGroupSpec]:
+    """
+    Generate the KV cache groups from the grouped specs.
+    """
+    assert len(grouped_specs) > 0 and all(
+        isinstance(spec, UniformTypeKVCacheSpecs) for spec in grouped_specs
+    )
+    # For now, we restrict the first grouped_spec to be UniformTypeKVCacheSpecs
+    # containing only MLAAttentionSpec.
+    full_mla_spec = grouped_specs[0]
+    assert all(
+        isinstance(spec, MLAAttentionSpec)
+        for spec in full_mla_spec.kv_cache_specs.values()
+    )
+    full_mla_group = KVCacheGroupSpec(
+        layer_names=list(full_mla_spec.kv_cache_specs.keys()),
+        kv_cache_spec=full_mla_spec,
+    )
+
+    # We define a layer tuple as a group of layers with different page sizes, and
+    # one UniformTypeKVCacheSpecs contains a list of layer tuples.
+    # For example, if we have 21 C4 layers and 20 C128 layers, we can define
+    # a layer tuple as [C4I, C4A, C128], and the full_mla_group will contain "21"
+    # layer tuples.
+    # The other uniform KV cache specs will be similarly partitioned into layer tuples.
+    # Say we have 43 SWA layers, all with the same page size, then we will have "43"
+    # layer tuples.
+    num_layer_tuples_per_group: list[int] = [
+        g_spec.get_num_layer_tuples() for g_spec in grouped_specs
+    ]
+    # Choose `num_layer_tuples` to minimize total padding across groups.
+    num_layer_tuples = approximate_gcd(
+        num_layer_tuples_per_group, lower_bound=num_layer_tuples_per_group[0]
+    )
+    # Round up to the nearest multiple of `num_layer_tuples` (i.e., padding)
+    num_layer_tuples_per_group = [
+        round_up(x, num_layer_tuples) for x in num_layer_tuples_per_group
+    ]
+
+    swa_mla_specs = grouped_specs[1:]
+    assert all(
+        isinstance(spec, SlidingWindowMLASpec)
+        for group in swa_mla_specs
+        for spec in group.kv_cache_specs.values()
+    )
+
+    # Split each SWA UniformKV group into smaller groups to align their #(layer tuples)
+    # Possibly padding layer tuples for this.
+    # Additionally, we also KV blocks in each layer, to ensure their page size to
+    # be the same as some layer's in the full-MLA group.
+    all_page_sizes = full_mla_spec.get_page_sizes()
+    swa_mla_groups = []
+    for sm_spec in swa_mla_specs:
+        sm_page_sizes = sm_spec.get_page_sizes()
+        layers_per_size: dict[int, list[str]] = defaultdict(list)
+        assert max(sm_page_sizes) <= max(all_page_sizes)
+
+        # Unify page size by padding layers' page_size to the nearest larger page_size.
+        for sm_page_size in sm_page_sizes:
+            # Find the nearest larger page_size as the target candidate.
+            candidate = min(x for x in all_page_sizes if x >= sm_page_size)
+            if sm_page_size < candidate:
+                # Padding layers to the nearest larger page_size.
+                for layer_name, layer_spec in sm_spec.kv_cache_specs.items():
+                    if layer_spec.page_size_bytes != sm_page_size:
+                        continue
+                    object.__setattr__(layer_spec, "page_size_padded", candidate)
+            # Collect all layer names that map to this candidate page_size.
+            for layer_name, layer_spec in sm_spec.kv_cache_specs.items():
+                if layer_spec.page_size_bytes == candidate:
+                    layers_per_size[candidate].append(layer_name)
+        # NOTE(yifan): for now, inside a UniformKV group, each page_size should
+        # have the same number of layers. This also means we don't need to pad layers
+        # inside a partial-full layer tuple.
+        assert len(set(len(layers) for layers in layers_per_size.values())) == 1
+        num_layers_per_size = len(next(iter(layers_per_size.values())))
+
+        # Split layers inside each UniformKV group for aligned #(layers).
+        # See `_get_kv_cache_groups_uniform_page_size` for more details.
+        num_tuple_groups = cdiv(num_layers_per_size, num_layer_tuples)
+        layer_tuples = list(zip(*layers_per_size.values()))
+        for i in range(num_tuple_groups):
+            group_layer_tuples = layer_tuples[i::num_tuple_groups]
+            # Flatten tuples and build dict for from_specs
+            group_layer_names = [
+                name for layer_tuple in group_layer_tuples for name in layer_tuple
+            ]
+            group_layer_specs = {
+                name: sm_spec.kv_cache_specs[name] for name in group_layer_names
+            }
+            sub_sm_spec = UniformTypeKVCacheSpecs.from_specs(group_layer_specs)
+            swa_mla_groups.append(
+                KVCacheGroupSpec(
+                    layer_names=group_layer_names,
+                    kv_cache_spec=sub_sm_spec,
+                )
+            )
+
+    return [full_mla_group, *swa_mla_groups]
 
 
 def get_kv_cache_groups(
@@ -1247,6 +1502,8 @@ def get_kv_cache_groups(
         # full attention, or all layers are sliding window attention with the
         # same window size). Put all layers into one group.
         return _get_kv_cache_groups_uniform_type(uniform_spec)
+    elif grouped_specs := group_and_unify_kv_cache_specs(kv_cache_spec):
+        return _get_kv_cache_groups_uniform_groups(grouped_specs)
 
     # As KVCacheManager can only allocate memory of one size, we need to unify
     # the page size of the layers. For cases cannot be unified, this function
@@ -1340,16 +1597,40 @@ def _max_memory_usage_bytes_from_groups(
     if not kv_cache_groups:
         return 0
 
-    # UniformTypeKVCacheSpecs special case (single group, per-layer specs)
     if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
+        # UniformTypeKVCacheSpecs special case (single group, per-layer specs)
         per_layer_specs = kv_cache_groups[0].kv_cache_spec.kv_cache_specs
         return sum(
             spec.max_memory_usage_bytes(vllm_config)
             for spec in per_layer_specs.values()
         )
+    elif all(
+        isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        for group in kv_cache_groups
+    ):
+        # Special case (only SVF for now): all groups are UniformTypeKVCacheSpecs.
+        # They must already be page_size aligned and #(layers) aligned.
+        # We can just use the first group's page_size and #(layers) to determine
+        # the number of blocks.
+        full_mla_group = kv_cache_groups[0]
+        layer_tuple_bytes = sum(full_mla_group.kv_cache_spec.get_page_sizes())
 
+        total_max_mem_usage_bytes = 0
+        for group in kv_cache_groups:
+            g_num_layer_tuples = group.kv_cache_spec.get_num_layer_tuples()
+            g_max_mem_usage_pages = group.kv_cache_spec.max_memory_usage_pages(
+                vllm_config
+            )
+            g_max_mem_usage_page_bytes = (
+                g_num_layer_tuples * g_max_mem_usage_pages * layer_tuple_bytes
+            )
+            total_max_mem_usage_bytes += g_max_mem_usage_page_bytes
+        return total_max_mem_usage_bytes
+
+    # FIXME(yifan): How can code below work for Mamba and SWA?
+    # Should we sum across all groups?
     # General case: group_size pools, each shared by one layer per group
     # Memory = group_size * page_size * blocks_for_max_len
     group_size = max(len(group.layer_names) for group in kv_cache_groups)
@@ -1590,6 +1871,7 @@ def get_kv_cache_configs(
                 vllm_config, projected_groups, available_memory_one_worker
             )
         )
+        # TODO(yifan): check if PP works for SVF
 
     # Change the num_blocks of each rank to the smallest among all ranks.
     # We also need to shrink the tensor size proportionally to avoid

@@ -82,6 +82,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.mla.indexer import (
+    DeepseekSVFIndexerBackend,
     DeepseekV32IndexerBackend,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
@@ -583,7 +584,12 @@ class DeepseekV2Attention(nn.Module):
 
 class DeepseekV32IndexerCache(torch.nn.Module, AttentionLayerBase):
     def __init__(
-        self, head_dim: int, dtype: torch.dtype, prefix: str, cache_config: CacheConfig
+        self,
+        head_dim: int,
+        dtype: torch.dtype,
+        prefix: str,
+        cache_config: CacheConfig,
+        compress_ratio: int = 1,
     ):
         super().__init__()
         self.kv_cache = [torch.tensor([])]
@@ -591,6 +597,7 @@ class DeepseekV32IndexerCache(torch.nn.Module, AttentionLayerBase):
         self.prefix = prefix
         self.cache_config = cache_config
         self.dtype = dtype
+        self.compress_ratio = compress_ratio
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -602,12 +609,18 @@ class DeepseekV32IndexerCache(torch.nn.Module, AttentionLayerBase):
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
+            model_version="svf" if self.compress_ratio > 1 else "v32",
+            compress_ratio=self.compress_ratio,
+            cache_dtype_str=self.cache_config.cache_dtype,
         )
 
     def forward(self): ...
 
-    def get_attn_backend(self) -> AttentionBackend:
-        return DeepseekV32IndexerBackend
+    def get_attn_backend(self) -> type[AttentionBackend]:
+        if self.compress_ratio == 1:
+            return DeepseekV32IndexerBackend
+        else:  # compress_ratio > 1, for Deepseek SVF
+            return DeepseekSVFIndexerBackend
 
 
 class Indexer(nn.Module):
@@ -620,6 +633,7 @@ class Indexer(nn.Module):
         quant_config: QuantizationConfig | None,
         cache_config: CacheConfig | None,
         topk_indices_buffer: torch.Tensor | None,
+        compress_ratio: int = 1,
         prefix: str = "",
     ):
         super().__init__()
@@ -631,6 +645,7 @@ class Indexer(nn.Module):
         self.head_dim = config.index_head_dim  # 128
         self.rope_dim = config.qk_rope_head_dim  # 64
         self.q_lora_rank = q_lora_rank  # 1536
+        self.compress_ratio = compress_ratio
         # no tensor parallel, just replicated
         self.wq_b = ReplicatedLinear(
             self.q_lora_rank,
@@ -660,20 +675,59 @@ class Indexer(nn.Module):
         self.quant_block_size = 128  # TODO: get from config
         self.topk_indices_buffer = topk_indices_buffer
 
-        # NOTE: (zyongye) we use fp8 naive cache,
-        #       where we store value in fp8 and scale in fp32
-        #       per self.quant_block_size element
-        self.k_cache = DeepseekV32IndexerCache(
-            head_dim=self.head_dim + self.head_dim // self.quant_block_size * 4,
-            dtype=torch.uint8,
-            prefix=f"{prefix}.k_cache",
-            cache_config=cache_config,
+        self.max_model_len = (
+            vllm_config.model_config.max_model_len // self.compress_ratio
         )
-        self.max_model_len = vllm_config.model_config.max_model_len
         self.prefix = prefix
         from vllm.v1.attention.backends.mla.indexer import get_max_prefill_buffer_size
 
-        self.max_total_seq_len = get_max_prefill_buffer_size(vllm_config)
+        self.max_total_seq_len = (
+            get_max_prefill_buffer_size(vllm_config) // self.compress_ratio
+        )
+
+        if self.compress_ratio == 1:
+            self.wk = ReplicatedLinear(
+                hidden_size,
+                self.head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.wk",
+            )
+            self.k_norm = LayerNorm(self.head_dim, eps=1e-6)
+            # NOTE: (zyongye) we use fp8 naive cache,
+            #       where we store value in fp8 and scale in fp32
+            #       per self.quant_block_size element
+            # NOTE(yifan): for head_dim of fp8 kv cache, we handle quantization
+            # format and scale factor in the MLAAttentionSpec
+            self.k_cache = DeepseekV32IndexerCache(
+                head_dim=self.head_dim,
+                dtype=torch.uint8,
+                prefix=f"{prefix}.k_cache",
+                cache_config=cache_config,
+            )
+        else:
+            from vllm.model_executor.layers.deepseek_compressor import (
+                DeepseekCompressor,
+            )
+
+            self.k_cache = DeepseekV32IndexerCache(
+                head_dim=self.head_dim,
+                dtype=torch.uint8,
+                prefix=f"{prefix}.k_cache",
+                cache_config=cache_config,
+                compress_ratio=self.compress_ratio,
+            )
+            self.compressor = None
+            if compress_ratio > 1:
+                self.compressor = DeepseekCompressor(
+                    vllm_config=vllm_config,
+                    compress_ratio=self.compress_ratio,
+                    hidden_size=hidden_size,
+                    head_dim=self.head_dim,
+                    rotate=True,
+                    prefix=f"{prefix}.compressor",
+                )
+
         self.indexer_op = SparseAttnIndexer(
             self.k_cache,
             self.quant_block_size,
@@ -686,32 +740,48 @@ class Indexer(nn.Module):
         )
 
     def forward(
-        self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
+        self,
+        hidden_states: torch.Tensor,
+        qr: torch.Tensor,
+        positions: torch.Tensor,
+        rotary_emb: nn.Module,
     ) -> torch.Tensor:
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
-        q_pe, q_nope = torch.split(
-            q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
-        )
 
-        k, _ = self.wk(hidden_states)
-        k = self.k_norm(k)
-        k_pe, k_nope = torch.split(
-            k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
-        )
+        if self.compress_ratio == 1:
+            q_pe, q_nope = torch.split(
+                q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+            )
+            if self.is_fp4_ckpt:
+                # Fused wk + weights_proj: one GEMM, then split
+                kw, _ = self.wk_weights_proj(hidden_states)
+                k = kw[:, : self.head_dim]
+                weights = kw[:, self.head_dim :]
+            else:
+                k, _ = self.wk(hidden_states)
+                weights, _ = self.weights_proj(hidden_states)
 
-        q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
-        # Note: RoPE (NeoX) can introduce extra leading dimensions during compilation
-        # so we need to reshape back to token-flattened shapes
-        q_pe = q_pe.reshape(-1, self.n_head, self.rope_dim)
-        k_pe = k_pe.reshape(-1, 1, self.rope_dim)
+            k = self.k_norm(k)
+            k_pe, k_nope = torch.split(
+                k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+            )
 
-        # `rotary_emb` is shape-preserving; `q_pe` is already
-        # [num_tokens, n_head, rope_dim].
-        q = torch.cat([q_pe, q_nope], dim=-1)
-        # `k_pe` is [num_tokens, 1, rope_dim] (MQA).
-        k = torch.cat([k_pe.squeeze(-2), k_nope], dim=-1)
+            q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
+            # Note: RoPE (NeoX) can introduce extra leading dimensions during compilation
+            # so we need to reshape back to token-flattened shapes
+            q_pe = q_pe.reshape(-1, self.n_head, self.rope_dim)
+            k_pe = k_pe.reshape(-1, 1, self.rope_dim)
 
+            # `rotary_emb` is shape-preserving; `q_pe` is already
+            # [num_tokens, n_head, rope_dim].
+            q = torch.cat([q_pe, q_nope], dim=-1)
+            # `k_pe` is [num_tokens, 1, rope_dim] (MQA).
+            k = torch.cat([k_pe.squeeze(-2), k_nope], dim=-1)
+        else:
+            q, _ = rotary_emb(positions, q)
+            k = self.compressor(hidden_states, positions, rotary_emb)
+            weights, _ = self.weights_proj(hidden_states)
         # we only quant q here since k quant is fused with cache insertion
         q = q.view(-1, self.head_dim)
         q_fp8, q_scale = per_token_group_quant_fp8(

@@ -381,6 +381,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         dcp_world_size: int,
         pcp_world_size: int,
         hash_block_size: int,
+        eagle_attn_layer_names: list[str] | None = None,
         metrics_collector: KVCacheMetricsCollector | None = None,
     ):
         super().__init__(
@@ -399,6 +400,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # different KV cache groups have different block sizes, the actual block size
         # can be a multiple of hash_block_size.
         self.hash_block_size = hash_block_size
+        self.eagle_attn_layer_names = eagle_attn_layer_names or []
         assert all(
             g.kv_cache_spec.block_size % hash_block_size == 0
             for g in kv_cache_config.kv_cache_groups
@@ -450,6 +452,26 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         block_sizes = [spec.block_size for spec, _, _ in attention_groups]
         self.lcm_block_size = lcm(*block_sizes)
 
+        # Determine which single type kv cache group should drop the EAGLE block.
+        self._eagle_attn_group_idx: int | None = None
+        if self.use_eagle:
+            self._eagle_attn_group_idx = self._find_eagle_attn_group_idx()
+
+    def _find_eagle_attn_group_idx(self) -> int:
+        """
+        Find the attention_group index that contains the EAGLE/MTP
+        attention layers, so we only apply the EAGLE block drop there.
+        """
+        eagle_names = set(self.eagle_attn_layer_names)
+        assert eagle_names, "EAGLE/MTP attention layers are not found"
+        for idx, (_, group_ids, _) in enumerate(self.attention_groups):
+            for gid in group_ids:
+                if eagle_names.intersection(
+                    self.kv_cache_config.kv_cache_groups[gid].layer_names
+                ):
+                    return idx
+        return 0
+
     def find_longest_cache_hit(
         self,
         block_hashes: list[BlockHash],
@@ -487,18 +509,20 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # Simple hybrid (1 full attn + 1 other): one iteration suffices.
         # Full attn is always first if it exists. This avoids EAGLE drops
         # being applied multiple times to non-full-attn groups.
-        # FIXME (yifan): However, for complex hybrid models with multiple attn
-        # groups, we still have the EAGLE spiral block dropping problem. See
-        # discussion in issue https://github.com/vllm-project/vllm/issues/32802.
         is_simple_hybrid = len(self.attention_groups) == 2 and isinstance(
             self.attention_groups[0][0], FullAttentionSpec
         )
+        # Otherwise, we apply and track EAGLE drops for groups with EAGLE/MTP layers.
+        eagle_dropped = False
 
         while True:
             curr_hit_length = hit_length
 
-            for spec, group_ids, manager_cls in self.attention_groups:
+            for idx, (spec, group_ids, manager_cls) in enumerate(self.attention_groups):
                 is_full_attn = isinstance(spec, FullAttentionSpec)
+                group_use_eagle = (
+                    idx == self._eagle_attn_group_idx and not eagle_dropped
+                )
 
                 # Full attention: reuse cached blocks (downward-closed property)
                 cached_blocks = hit_blocks_by_group[group_ids[0]]
@@ -517,10 +541,16 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                         kv_cache_group_ids=group_ids,
                         block_pool=self.block_pool,
                         kv_cache_spec=spec,
-                        use_eagle=self.use_eagle,
+                        use_eagle=group_use_eagle,
                         alignment_tokens=self.lcm_block_size,
                     )
-                    curr_hit_length = len(hit_blocks[0]) * spec.block_size
+                    _curr_hit_length = len(hit_blocks[0]) * spec.block_size
+                    shrunk = _curr_hit_length < curr_hit_length
+                    curr_hit_length = _curr_hit_length
+                    if group_use_eagle:
+                        eagle_dropped = True
+                    elif shrunk:
+                        eagle_dropped = False
                     for group_id, blocks in zip(group_ids, hit_blocks):
                         hit_blocks_by_group[group_id] = blocks
 
@@ -553,6 +583,7 @@ def get_kv_cache_coordinator(
     dcp_world_size: int,
     pcp_world_size: int,
     hash_block_size: int,
+    eagle_attn_layer_names: list[str] | None = None,
     metrics_collector: KVCacheMetricsCollector | None = None,
 ) -> KVCacheCoordinator:
     if not enable_caching:
@@ -587,5 +618,6 @@ def get_kv_cache_coordinator(
         dcp_world_size=dcp_world_size,
         pcp_world_size=pcp_world_size,
         hash_block_size=hash_block_size,
+        eagle_attn_layer_names=eagle_attn_layer_names,
         metrics_collector=metrics_collector,
     )

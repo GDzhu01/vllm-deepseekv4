@@ -26,6 +26,7 @@ from vllm.v1.attention.backend import (
     MultipleOf,
     SparseMLAAttentionImpl,
 )
+from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
 from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
 )
@@ -64,8 +65,8 @@ MIN_HEADS_FOR_BF16_PREFILL = 32
 """
 NOTE: FlashMLA Sparse uses an fp8 cache with the following format
 
-In the "FP8 with scale" format, each token's KV cache is 656 Bytes,
-structured as:
+For DeepSeek V3.2, in the "FP8 with scale" format, each token's KV cache is 656
+Bytes, structured as:
 -   **First 512 bytes:** The "quantized NoPE" part, containing 512
     `float8_e4m3` values.
 -   **Next 16 bytes:** Scale factors, containing 4 `float32` values.
@@ -73,6 +74,16 @@ structured as:
     the second for the next 128, and so on.
 -   **Last 128 bytes:** The "RoPE" part, containing 64 `bfloat16` values. This
     part is not quantized for accuracy.
+
+For DeepSeek SVF, in the "FP8 with scale" format, each token's KV cache is 584
+Bytes, structured as:
+-   **First 448 bytes:** The "quantized NoPE" part, containing 448
+    `float8_e4m3` values.
+-   **Next 128 bytes:** The "RoPE" part, containing 64 `bfloat16` values. This
+    part is not quantized for accuracy.
+-   **Last 8 bytes:** Scale factors, containing 7 `ue8m0` values + 1B pad.
+    The first `ue8m0` is the scale for the first 64 `float8_e4m3` values,
+    the second for the next 64, and so on.
 """
 
 
@@ -104,7 +115,8 @@ class FlashMLASparseBackend(AttentionBackend):
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
-        return [576]
+        # V3.2: 576 (512 NoPE + 64 RoPE); SVF: 512 (448 NoPE + 64 RoPE)
+        return [512, 576]
 
     @classmethod
     def is_mla(cls) -> bool:
@@ -126,12 +138,17 @@ class FlashMLASparseBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
-        if cache_dtype_str == "fp8_ds_mla":
-            # custom storage format is 656 bytes
-            #  see FlashMLA readme.md for details
-            return (num_blocks, block_size, 656)
-        else:
-            return (num_blocks, block_size, head_size)
+        return (num_blocks, block_size, head_size)
+
+
+class SVFFlashMLASparseBackend(FlashMLASparseBackend):
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        return [256]
+
+    @staticmethod
+    def get_name() -> str:
+        return "SVF_FLASHMLA_SPARSE"
 
 
 @dataclass
@@ -159,6 +176,7 @@ class FlashMLASparseMetadata(AttentionMetadata):
     class FP8SeparatePrefillDecode:
         @dataclass
         class Decode:
+            seq_lens: torch.Tensor
             kernel_metadata: "FlashMLASparseMetadata.FP8KernelMetadata"
             decode_query_len: int  # needed for reshape in spec decode
 
@@ -299,6 +317,27 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             dtype=torch.int32,
             device=device,
         )
+
+        # SVF: has compress_ratios in hf_config.
+        hf_config = vllm_config.model_config.hf_config
+        self.is_svf = (
+            hasattr(hf_config, "compress_ratios") and len(hf_config.compress_ratios) > 0
+        )
+        self.compress_ratio = 1
+        if self.is_svf:
+            assert hasattr(self.kv_cache_spec, "compress_ratio")
+            self.compress_ratio = self.kv_cache_spec.compress_ratio
+            # Pre-allocate compressed slot mapping buffer for CUDA graph
+            # address stability when compress_ratio > 1.
+            if self.compress_ratio > 1:
+                max_num_batched_tokens = (
+                    vllm_config.scheduler_config.max_num_batched_tokens
+                )
+                self.compressed_slot_mapping_buffer = torch.empty(
+                    max_num_batched_tokens,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
 
     def _build_fp8_mixed_decode_prefill(
         self,
@@ -457,15 +496,7 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             decode_query_len = (query_start_loc_cpu[1] - query_start_loc_cpu[0]).item()
 
             # Use padded head count since that's what the kernel will see
-            padded_heads = self.fp8_decode_padded_heads
-            scheduler_metadata, _ = get_mla_metadata(
-                cache_seqlens=self.topk_tokens_tensor[:num_decodes],
-                num_q_tokens_per_head_k=decode_query_len * padded_heads,
-                topk=self.topk_tokens,
-                num_heads_q=padded_heads,
-                num_heads_k=1,
-                is_fp8_kvcache=True,
-            )
+            scheduler_metadata, _ = get_mla_metadata()
 
             kernel_meta = FlashMLASparseMetadata.FP8KernelMetadata(
                 scheduler_metadata=scheduler_metadata,
@@ -473,6 +504,7 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
                 cache_lens=self.max_model_len_tensor[:num_decodes],
             )
             fp8_metadata.decode = FP8Meta.Decode(
+                seq_lens=common_attn_metadata.seq_lens[:num_decodes],
                 kernel_metadata=kernel_meta,
                 decode_query_len=decode_query_len,
             )
@@ -499,12 +531,26 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
         )
         req_id_per_token = self.req_id_per_token_buffer[:num_tokens]
 
+        slot_mapping = cm.slot_mapping
+        if self.compress_ratio > 1:
+            slot_mapping = get_compressed_slot_mapping(
+                common_attn_metadata.num_actual_tokens,
+                common_attn_metadata.query_start_loc,
+                common_attn_metadata.seq_lens,
+                common_attn_metadata.block_table_tensor.clamp(min=0),
+                int(self.kv_cache_spec.storage_block_size),
+                self.compress_ratio,
+                out=self.compressed_slot_mapping_buffer,
+            )
+
         fp8_extra_metadata: (
             FlashMLASparseMetadata.FP8SeparatePrefillDecode
             | FlashMLASparseMetadata.FP8KernelMetadata
             | None
         ) = None
-        fp8_use_mixed_batch = self.num_heads < MIN_HEADS_FOR_BF16_PREFILL
+        fp8_use_mixed_batch = (
+            self.num_heads < MIN_HEADS_FOR_BF16_PREFILL and not self.is_svf
+        )
         if self.use_fp8_kv_cache:
             if fp8_use_mixed_batch:
                 fp8_extra_metadata = self._build_fp8_mixed_decode_prefill(cm)
@@ -517,7 +563,7 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             max_seq_len=cm.max_seq_len,
             num_actual_tokens=cm.num_actual_tokens,
             query_start_loc=cm.query_start_loc,
-            slot_mapping=cm.slot_mapping,
+            slot_mapping=slot_mapping,
             block_table=cm.block_table_tensor,
             req_id_per_token=req_id_per_token,
             block_size=self.kv_cache_spec.block_size,
@@ -549,7 +595,7 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         attn_type: str,
         kv_sharing_target_layer_name: str | None,
         # MLA Specific Arguments
-        topk_indice_buffer: torch.Tensor | None = None,
+        topk_indices_buffer: torch.Tensor | None = None,
         indexer: "Indexer | None" = None,
         **mla_args,
     ) -> None:
@@ -612,7 +658,11 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
             NUM_TOPK_TOKENS=topk_indices.shape[1],
         )
 
-        return self._bf16_flash_mla_kernel(q, kv_c_and_k_pe_cache, topk_indices)
+        return self._bf16_flash_mla_kernel(
+            q,
+            kv_c_and_k_pe_cache,
+            topk_indices,
+        )
 
     def _forward_fp8_kv_separate_prefill_decode(
         self,
@@ -653,7 +703,10 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         fp8_metadata = attn_metadata.fp8_extra_metadata
         assert isinstance(fp8_metadata, FlashMLASparseMetadata.FP8SeparatePrefillDecode)
 
-        def _fp8_decode(q: torch.Tensor, topk_indices: torch.Tensor) -> torch.Tensor:
+        def _fp8_decode(
+            q: torch.Tensor,
+            topk_indices: torch.Tensor,
+        ) -> torch.Tensor:
             # Reshape q: (num_decode_tokens, num_heads, head_dim)
             #         -> (num_decodes, seq_len, num_heads, head_dim)
             q = reshape_query_for_spec_decode(q, num_decodes)
@@ -689,7 +742,8 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
 
             if num_decode_tokens > 0:
                 attn_out[:num_decode_tokens] = _fp8_decode(
-                    q[:num_decode_tokens], topk_indices[:num_decode_tokens]
+                    q[:num_decode_tokens],
+                    topk_indices[:num_decode_tokens],
                 )
 
             assert fp8_metadata.prefill is not None
@@ -820,6 +874,7 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         output = flash_mla_sparse_fwd(
             q, kv_c_and_k_pe_cache, topk_indices, self.softmax_scale
         )[0]
+
         output = output[:, : self.num_heads, :]
         return output
 

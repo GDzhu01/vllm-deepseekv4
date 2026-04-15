@@ -22,6 +22,7 @@ class SharedFusedMoE(FusedMoE):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.use_overlapped:
             if self._shared_experts is not None:

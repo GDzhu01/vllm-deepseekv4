@@ -19,6 +19,7 @@ class MoERunner(ABC):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError
 
