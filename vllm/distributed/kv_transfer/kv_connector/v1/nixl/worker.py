@@ -340,6 +340,26 @@ class NixlConnectorWorker:
         )
 
     def _sync_block_size_with_kernel(self) -> None:
+        # Heterogeneous block sizes across KV cache groups (e.g. SVF with
+        # per-SWA-group block sizes) are incompatible with global block
+        # splitting.  Detect and bail out early.
+        group_block_sizes = {
+            g.kv_cache_spec.block_size for g in self.kv_cache_config.kv_cache_groups
+        }
+        if len(group_block_sizes) > 1:
+            if not self.use_mla:
+                raise ValueError(
+                    f"Heterogeneous kernel block sizes {group_block_sizes} "
+                    f"are not supported for non-MLA models."
+                )
+            logger.debug(
+                "Heterogeneous block sizes detected across KV cache "
+                "groups: %s. Keeping logical block size %s unchanged.",
+                group_block_sizes,
+                self.block_size,
+            )
+            return
+
         backends = get_current_attn_backends(self.vllm_config)
         kernel_block_size = select_common_block_size(self.block_size, backends)
         # Number of blocks not accounting for kernel block mismatches
@@ -728,6 +748,7 @@ class NixlConnectorWorker:
                 else layer_spec.page_size_bytes
                 // self._physical_blocks_per_logical_kv_block
             )
+            # TODO(yifan): double check: KV cache blocks can be padded (page_size_padded).
             # For when registering multiple tensors eg K/V in separate regions.
             physical_page_size = physical_page_size // len(cache_list)
             if self.kv_topo._cross_layers_blocks:

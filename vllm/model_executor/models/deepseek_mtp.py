@@ -5,14 +5,22 @@ from collections.abc import Callable, Iterable
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import PretrainedConfig
 
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import SharedFusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.linear import (
+    ReplicatedLinear,
+)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -26,6 +34,9 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
+from .deepseek_svf import (
+    DeepseekSVFDecoderLayer,
+)
 from .deepseek_v2 import (
     DeepseekV2DecoderLayer,
     DeepseekV2MixtureOfExperts,
@@ -58,40 +69,100 @@ class SharedHead(nn.Module):
 
 
 class DeepSeekMultiTokenPredictorLayer(nn.Module):
-    def __init__(self, vllm_config: VllmConfig, prefix: str) -> None:
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        topk_indices_buffer: torch.Tensor,
+        prefix: str,
+    ) -> None:
         super().__init__()
 
         config = vllm_config.speculative_config.draft_model_config.hf_config
         self.config = config
         quant_config = vllm_config.quant_config
+        self.is_svf = hasattr(config, "compress_ratios")
+        self.is_v32 = hasattr(config, "index_topk") and not self.is_svf
+        self.rms_norm_eps = config.rms_norm_eps
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
+        if self.is_svf:
+            # svf uses separate e_ and h_ proj with fp8 linear quant
+            self.e_proj = ReplicatedLinear(
+                config.hidden_size,
+                config.hidden_size,
+                bias=False,
+                return_bias=False,
+                quant_config=quant_config,
+            )
 
-        self.device = current_platform.device_type
+            self.h_proj = ReplicatedLinear(
+                config.hidden_size,
+                config.hidden_size,
+                bias=False,
+                return_bias=False,
+                quant_config=quant_config,
+            )
 
-        self.is_v32 = hasattr(config, "index_topk")
-        if self.is_v32:
-            topk_tokens = config.index_topk
-            topk_indices_buffer = torch.empty(
-                vllm_config.scheduler_config.max_num_batched_tokens,
-                topk_tokens,
-                dtype=torch.int32,
-                device=self.device,
+            self.hc_eps = config.hc_eps
+            self.hc_mult = config.hc_mult
+            self.hc_dim = self.hc_mult * config.hidden_size
+            self.hc_head_fn = nn.Parameter(
+                torch.empty(
+                    self.hc_mult,
+                    self.hc_dim,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            self.hc_head_base = nn.Parameter(
+                torch.empty(
+                    self.hc_mult,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            self.hc_head_scale = nn.Parameter(
+                torch.empty(1, dtype=torch.float32),
+                requires_grad=False,
             )
         else:
-            topk_indices_buffer = None
+            self.eh_proj = nn.Linear(
+                config.hidden_size * 2, config.hidden_size, bias=False
+            )
 
         self.shared_head = SharedHead(
             config=config, prefix=prefix, quant_config=quant_config
         )
-        self.mtp_block = DeepseekV2DecoderLayer(
-            vllm_config,
-            prefix,
-            config=self.config,
-            topk_indices_buffer=topk_indices_buffer,
-        )
+        if self.is_svf:
+            self.mtp_block = DeepseekSVFDecoderLayer(
+                vllm_config,
+                prefix,
+                topk_indices_buffer=topk_indices_buffer,
+            )
+        else:
+            self.mtp_block = DeepseekV2DecoderLayer(
+                vllm_config,
+                prefix,
+                config=self.config,
+                topk_indices_buffer=topk_indices_buffer,
+            )
+
+    def hc_head(
+        self,
+        hidden_states: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+    ) -> torch.Tensor:
+        x = hidden_states
+        shape, dtype = x.size(), x.dtype
+        x = x.flatten(1).float()
+        rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.rms_norm_eps)
+        mixes = F.linear(x, hc_fn) * rsqrt
+        pre = torch.sigmoid(mixes * hc_scale + hc_base) + self.hc_eps
+        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=1)
+        return y.to(dtype)
 
     def forward(
         self,
@@ -107,14 +178,29 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         inputs_embeds = self.enorm(inputs_embeds)
         previous_hidden_states = self.hnorm(previous_hidden_states)
 
-        hidden_states = self.eh_proj(
-            torch.cat([inputs_embeds, previous_hidden_states], dim=-1)
-        )
+        if self.is_svf:
+            hidden_states = self.e_proj(inputs_embeds) + self.h_proj(
+                previous_hidden_states
+            )
+            hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+            hidden_states = self.mtp_block(
+                positions=positions, x=hidden_states, input_ids=None
+            )
+            hidden_states = self.hc_head(
+                hidden_states,
+                self.hc_head_fn,
+                self.hc_head_scale,
+                self.hc_head_base,
+            )
+        else:
+            hidden_states = self.eh_proj(
+                torch.cat([inputs_embeds, previous_hidden_states], dim=-1)
+            )
 
-        hidden_states, residual = self.mtp_block(
-            positions=positions, hidden_states=hidden_states, residual=None
-        )
-        hidden_states = residual + hidden_states
+            hidden_states, residual = self.mtp_block(
+                positions=positions, hidden_states=hidden_states, residual=None
+            )
+            hidden_states = residual + hidden_states
         return hidden_states
 
 
@@ -124,12 +210,28 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         config = vllm_config.model_config.hf_config
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.num_mtp_layers = config.num_nextn_predict_layers
-        # to map the exact layer index from weights
+        self.is_svf = hasattr(config, "compress_ratios")
+        self.is_v32 = hasattr(config, "index_topk") and not self.is_svf
+        self.device = current_platform.device_type
 
+        if self.is_v32 or self.is_svf:
+            topk_tokens = config.index_topk
+            self.topk_indices_buffer = torch.empty(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                topk_tokens,
+                dtype=torch.int32,
+                device=self.device,
+            )
+        else:
+            self.topk_indices_buffer = None
+
+        # to map the exact layer index from weights
         self.layers = torch.nn.ModuleDict(
             {
                 str(idx): DeepSeekMultiTokenPredictorLayer(
-                    vllm_config, f"{prefix}.layers.{idx}"
+                    vllm_config,
+                    self.topk_indices_buffer,
+                    f"{prefix}.layers.{idx}",
                 )
                 for idx in range(
                     self.mtp_start_layer_idx,
@@ -188,12 +290,15 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
         self.model = DeepSeekMultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
-        # Set MoE hyperparameters
-        self.set_moe_parameters()
+
         self.is_fp4_ckpt = (
             self.quant_config is not None
             and self.quant_config.get_name() == "modelopt_fp4"
         )
+        self.is_svf = hasattr(self.config, "compress_ratios")
+        if not self.is_svf:
+            # Set MoE hyperparameters
+            self.set_moe_parameters()
 
     def set_moe_parameters(self):
         self.expert_weights = []
@@ -237,7 +342,7 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
     ) -> torch.Tensor | None:
         return self.model.compute_logits(hidden_states, spec_step_idx)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+    def _load_weights_v2(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         rocm_aiter_moe_shared_expert_enabled = (
             rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
         )
@@ -450,20 +555,175 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
 
         return loaded_params
 
+    def _load_weights_svf(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> set[str]:
+        # Weight name remapping for checkpoint compatibility.
+        # Maps checkpoint weight paths to model parameter paths.
+        WEIGHT_NAME_REMAPPING: dict[str, str] = {
+            ".emb.tok_emb.weight": ".embed_tokens.weight",
+            ".head.weight": ".shared_head.head.weight",
+            ".norm.weight": ".shared_head.norm.weight",
+        }
+
+        def _remap_weight_name(name: str) -> str:
+            """Remap checkpoint weight names to model parameter names."""
+            for old_pattern, new_pattern in WEIGHT_NAME_REMAPPING.items():
+                if old_pattern in name:
+                    name = name.replace(old_pattern, new_pattern)
+            return name
+
+        def _find_mtp_layer_idx(name: str) -> int:
+            subnames = name.split(".")
+            for subname in subnames:
+                try:
+                    # we return the first encounted integer
+                    return int(subname)
+                except ValueError:
+                    continue
+            return 0
+
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("gate_up_proj", "w1", 0),
+            ("gate_up_proj", "w3", 1),
+            ("attn.fused_wqa_wkv", "attn.wq_a", 0),
+            ("attn.fused_wqa_wkv", "attn.wkv", 1),
+        ]
+        params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
+
+        # TP for attention
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+        n_head = self.config.num_attention_heads
+        n_local_head = n_head // tp_size
+        head_rank_start = n_local_head * tp_rank
+        head_rank_end = n_local_head * (tp_rank + 1)
+
+        # Pre-compute expert mapping ONCE.
+        expert_mapping = SharedFusedMoE.make_expert_params_mapping(
+            self,
+            ckpt_gate_proj_name="w1",
+            ckpt_down_proj_name="w2",
+            ckpt_up_proj_name="w3",
+            num_experts=self.config.n_routed_experts,
+        )
+
+        for name, loaded_weight in weights:
+            mtp_layer_idx = _find_mtp_layer_idx(name)
+            # remap all the spec layer name into old convention name
+            name = name.replace(
+                f".mtp.{mtp_layer_idx}.",
+                f".layers.{self.config.num_hidden_layers + mtp_layer_idx}.",
+            )
+
+            spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
+            if spec_layer is None:
+                continue
+
+            name = _remap_weight_name(name)
+            name = self._rewrite_spec_layer_name(spec_layer, name)
+
+            if spec_layer != self.model.mtp_start_layer_idx and ".layers" not in name:
+                continue
+            if name.endswith(".scale"):
+                name = name.removesuffix(".scale") + ".weight_scale_inv"
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                # Skip non-stacked layers and experts (experts handled below).
+                if ".experts." in name:
+                    continue
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(name)
+                break
+            else:
+                if ".experts." in name:
+                    for mapping in expert_mapping:
+                        param_name, weight_name, expert_id, shard_id = mapping
+                        if weight_name not in name:
+                            continue
+                        name_mapped = name.replace(weight_name, param_name)
+                        param = params_dict[name_mapped]
+                        # We should ask the weight loader to return success or not
+                        # here since otherwise we may skip experts with other
+                        # available replicas.
+                        weight_loader = typing.cast(
+                            Callable[..., bool], param.weight_loader
+                        )
+                        success = weight_loader(
+                            param,
+                            loaded_weight,
+                            name_mapped,
+                            shard_id=shard_id,
+                            expert_id=expert_id,
+                            return_success=True,
+                        )
+                        if success:
+                            name = name_mapped
+                            break
+                    loaded_params.add(name_mapped)
+                    continue
+                elif "attn_sink" in name:
+                    narrow_weight = loaded_weight[head_rank_start:head_rank_end]
+                    params_dict[name].copy_(narrow_weight)
+                    loaded_params.add(name)
+                    continue
+                else:
+                    if ".shared_experts.w2" in name:
+                        name = name.replace(
+                            ".shared_experts.w2", ".shared_experts.down_proj"
+                        )
+                    if name.endswith(".ffn.gate.bias"):
+                        name = name.replace(".bias", ".e_score_correction_bias")
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+                    loaded_params.add(name)
+                    continue
+        return loaded_params
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        if self.is_svf:
+            return self._load_weights_svf(weights)
+        else:
+            return self._load_weights_v2(weights)
+
     def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:
         """
         Rewrite the weight name to match the format of the original model.
         Add .mtp_block for modules in transformer layer block for spec layer
         and rename shared layer weights to be top level.
         """
-        spec_layer_weight_names = [
-            "embed_tokens",
-            "enorm",
-            "hnorm",
-            "eh_proj",
-            "shared_head",
-        ]
-        shared_weight_names = ["embed_tokens"]
+        if self.is_svf:
+            spec_layer_weight_names = [
+                "embed_tokens",
+                "enorm",
+                "hnorm",
+                "h_proj",
+                "e_proj",
+                "shared_head",
+                "hc_head_fn",
+                "hc_head_base",
+                "hc_head_scale",
+            ]
+            shared_weight_names = ["embed_tokens"]
+        else:
+            spec_layer_weight_names = [
+                "embed_tokens",
+                "enorm",
+                "hnorm",
+                "eh_proj",
+                "shared_head",
+            ]
+            shared_weight_names = ["embed_tokens"]
         spec_layer_weight = False
         shared_weight = False
         for weight_name in spec_layer_weight_names:

@@ -127,12 +127,14 @@ def _missing(*_: Any, **__: Any) -> NoReturn:
     )
 
 
+_cublaslt_gemm_nt_impl: Callable[..., Any] | None = None
 _fp8_gemm_nt_impl: Callable[..., Any] | None = None
 _grouped_impl: Callable[..., Any] | None = None
 _grouped_masked_impl: Callable[..., Any] | None = None
 _fp8_mqa_logits_impl: Callable[..., Any] | None = None
 _fp8_paged_mqa_logits_impl: Callable[..., Any] | None = None
 _get_paged_mqa_logits_metadata_impl: Callable[..., Any] | None = None
+_tf32_hc_prenorm_gemm_impl: Callable[..., Any] | None = None
 _get_mn_major_tma_aligned_tensor_impl: Callable[..., Any] | None = None
 _get_mk_alignment_for_contiguous_layout_impl: Callable[..., Any] | None = None
 _transform_sf_into_required_layout_impl: Callable[..., Any] | None = None
@@ -175,20 +177,24 @@ def _import_deep_gemm():
 
 def _lazy_init() -> None:
     """Import deep_gemm and resolve symbols on first use."""
+    global _cublaslt_gemm_nt_impl
     global _fp8_gemm_nt_impl, _grouped_impl, _grouped_masked_impl
     global _fp8_mqa_logits_impl, _fp8_paged_mqa_logits_impl
     global _get_paged_mqa_logits_metadata_impl
+    global _tf32_hc_prenorm_gemm_impl
     global _get_mn_major_tma_aligned_tensor_impl
     global _get_mk_alignment_for_contiguous_layout_impl
     global _transform_sf_into_required_layout_impl
     # fast path
     if (
-        _fp8_gemm_nt_impl is not None
+        _cublaslt_gemm_nt_impl is not None
+        or _fp8_gemm_nt_impl is not None
         or _grouped_impl is not None
         or _grouped_masked_impl is not None
         or _fp8_mqa_logits_impl is not None
         or _fp8_paged_mqa_logits_impl is not None
         or _get_paged_mqa_logits_metadata_impl is not None
+        or _tf32_hc_prenorm_gemm_impl is not None
         or _get_mk_alignment_for_contiguous_layout_impl is not None
         or _transform_sf_into_required_layout_impl is not None
     ):
@@ -208,6 +214,7 @@ def _lazy_init() -> None:
     if _dg is None:
         return
 
+    _cublaslt_gemm_nt_impl = getattr(_dg, "cublaslt_gemm_nt", None)
     _fp8_gemm_nt_impl = getattr(_dg, "fp8_gemm_nt", None)
     _grouped_impl = getattr(_dg, "m_grouped_fp8_gemm_nt_contiguous", None)
     _grouped_masked_impl = getattr(_dg, "fp8_m_grouped_gemm_nt_masked", None)
@@ -216,6 +223,7 @@ def _lazy_init() -> None:
     _get_paged_mqa_logits_metadata_impl = getattr(
         _dg, "get_paged_mqa_logits_metadata", None
     )
+    _tf32_hc_prenorm_gemm_impl = getattr(_dg, "tf32_hc_prenorm_gemm", None)
     _get_mn_major_tma_aligned_tensor_impl = getattr(
         _dg, "get_mn_major_tma_aligned_tensor", None
     )
@@ -259,6 +267,13 @@ def get_col_major_tma_aligned_tensor(x: torch.Tensor) -> torch.Tensor:
     if _get_mn_major_tma_aligned_tensor_impl is None:
         return _missing()
     return _get_mn_major_tma_aligned_tensor_impl(x)
+
+
+def cublaslt_gemm_nt(*args, **kwargs):
+    _lazy_init()
+    if _cublaslt_gemm_nt_impl is None:
+        return _missing(*args, **kwargs)
+    return _cublaslt_gemm_nt_impl(*args, **kwargs)
 
 
 def fp8_gemm_nt(*args, **kwargs):
@@ -399,6 +414,32 @@ def fp8_paged_mqa_logits(
         schedule_metadata,
         max_model_len,
         clean_logits=clean_logits,
+    )
+
+
+def tf32_hc_prenorm_gemm(
+    x: torch.Tensor,
+    fn: torch.Tensor,
+    out: torch.Tensor,
+    sqrsum: torch.Tensor,
+    num_split: int,
+) -> torch.Tensor:
+    """
+    Perform the following computation:
+        out = x.float() @ fn.T
+        sqrsum = x.float().square().sum(-1)
+
+    See the caller function for shape requirement
+    """
+    _lazy_init()
+    if _tf32_hc_prenorm_gemm_impl is None:
+        return _missing()
+    return _tf32_hc_prenorm_gemm_impl(
+        x,
+        fn,
+        out,
+        sqrsum,
+        num_split,
     )
 
 
