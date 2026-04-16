@@ -59,7 +59,7 @@ steps:
   - vllm/model_executor/models/qwen3_next_mtp.py
   - vllm/model_executor/layers/fla/ops/
   commands:
-  - pytest -s -v evals/gsm8k/test_gsm8k_correctness.py --config-list-file=configs/models-qwen35-blackwell.txt
+    - pytest -s -v evals/gsm8k/test_gsm8k_correctness.py --config-list-file=configs/models-qwen35-blackwell.txt
 
 - label: LM Eval Large Models (H200)
   timeout_in_minutes: 60
@@ -89,7 +89,6 @@ steps:
   num_devices: 2
   commands:
     - pytest -s -v evals/gsm8k/test_gsm8k_correctness.py --config-list-file=evals/gsm8k/configs/moe-refactor-dp-ep/config-b200.txt
-
 
 - label: GPQA Eval (GPT-OSS) (H100)
   timeout_in_minutes: 120

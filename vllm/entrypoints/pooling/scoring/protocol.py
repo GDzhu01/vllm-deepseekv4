@@ -12,32 +12,17 @@ from vllm.entrypoints.pooling.base.protocol import (
     ClassifyRequestMixin,
     PoolingBasicRequestMixin,
 )
+from vllm.entrypoints.pooling.score.utils import (
+    ScoreContentPartParam,
+    ScoreInput,
+    ScoreInputs,
+)
 from vllm.renderers import TokenizeParams
 from vllm.tasks import PoolingTask
 from vllm.utils import random_uuid
 
-from .typing import ScoreContentPartParam, ScoreInput
-
 
 class ScoreRequestMixin(PoolingBasicRequestMixin, ClassifyRequestMixin):
-    max_tokens_per_query: int = Field(
-        default=0,
-        description=(
-            "Maximum number of tokens per query. Queries longer than "
-            "this will be truncated to this length. 0 means no "
-            "query-level truncation is applied."
-        ),
-    )
-    max_tokens_per_doc: int = Field(
-        default=0,
-        description=(
-            "Maximum number of tokens per document. Documents longer than "
-            "this will be truncated to this length. 0 means no "
-            "document-level truncation is applied (only truncate_prompt_tokens "
-            "applies to the combined query+document)."
-        ),
-    )
-
     def build_tok_params(self, model_config: ModelConfig) -> TokenizeParams:
         encoder_config = model_config.encoder_config or {}
 
@@ -50,7 +35,7 @@ class ScoreRequestMixin(PoolingBasicRequestMixin, ClassifyRequestMixin):
             max_total_tokens_param="max_model_len",
         )
 
-    def to_pooling_params(self, task: PoolingTask = "classify"):
+    def to_pooling_params(self, task: PoolingTask = "score"):
         return PoolingParams(
             task=task,
             use_activation=self.use_activation,
@@ -58,13 +43,13 @@ class ScoreRequestMixin(PoolingBasicRequestMixin, ClassifyRequestMixin):
 
 
 class ScoreDataRequest(ScoreRequestMixin):
-    data_1: ScoreInput | list[ScoreInput]
-    data_2: ScoreInput | list[ScoreInput]
+    data_1: ScoreInputs
+    data_2: ScoreInputs
 
 
 class ScoreQueriesDocumentsRequest(ScoreRequestMixin):
-    queries: ScoreInput | list[ScoreInput]
-    documents: ScoreInput | list[ScoreInput]
+    queries: ScoreInputs
+    documents: ScoreInputs
 
     @property
     def data_1(self):
@@ -76,8 +61,8 @@ class ScoreQueriesDocumentsRequest(ScoreRequestMixin):
 
 
 class ScoreQueriesItemsRequest(ScoreRequestMixin):
-    queries: ScoreInput | list[ScoreInput]
-    items: ScoreInput | list[ScoreInput]
+    queries: ScoreInputs
+    items: ScoreInputs
 
     @property
     def data_1(self):
@@ -89,8 +74,8 @@ class ScoreQueriesItemsRequest(ScoreRequestMixin):
 
 
 class ScoreTextRequest(ScoreRequestMixin):
-    text_1: ScoreInput | list[ScoreInput]
-    text_2: ScoreInput | list[ScoreInput]
+    text_1: ScoreInputs
+    text_2: ScoreInputs
 
     @property
     def data_1(self):
@@ -109,13 +94,28 @@ ScoreRequest: TypeAlias = (
 )
 
 
-class RerankRequest(ScoreRequestMixin):
+class RerankRequest(PoolingBasicRequestMixin, ClassifyRequestMixin):
     query: ScoreInput
-    documents: ScoreInput | list[ScoreInput]
+    documents: ScoreInputs
     top_n: int = Field(default_factory=lambda: 0)
 
+    def build_tok_params(self, model_config: ModelConfig) -> TokenizeParams:
+        encoder_config = model_config.encoder_config or {}
 
-ScoringRequest: TypeAlias = ScoreRequest | RerankRequest
+        return TokenizeParams(
+            max_total_tokens=model_config.max_model_len,
+            max_output_tokens=0,
+            truncate_prompt_tokens=self.truncate_prompt_tokens,
+            truncation_side=self.truncation_side,
+            do_lower_case=encoder_config.get("do_lower_case", False),
+            max_total_tokens_param="max_model_len",
+        )
+
+    def to_pooling_params(self, task: PoolingTask = "score"):
+        return PoolingParams(
+            task=task,
+            use_activation=self.use_activation,
+        )
 
 
 class RerankDocument(BaseModel):
@@ -154,6 +154,3 @@ class ScoreResponse(OpenAIBaseModel):
     model: str
     data: list[ScoreResponseData]
     usage: UsageInfo
-
-
-ScoringResponse: TypeAlias = RerankResponse | ScoreResponse
