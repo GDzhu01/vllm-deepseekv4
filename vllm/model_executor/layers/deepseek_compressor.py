@@ -143,6 +143,7 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
         # - C4 compressor block shape [4, 2*512*2*4] -> block_size = 4
         # - C128 compressor block shape [8, 512*2*4] -> block_size = 8
         # TODO(yifan): make block size automatically determined and configurable.
+        # TODO(zyj): change the block size here.
         if compress_ratio == 4:
             self.block_size = 4
         elif compress_ratio == 128:

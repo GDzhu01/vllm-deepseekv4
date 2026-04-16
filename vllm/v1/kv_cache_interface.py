@@ -279,6 +279,9 @@ def _init_mla_cache_fields(spec: MLAAttentionSpec | SlidingWindowMLASpec):
         elif spec.head_size != 656:
             raise ValueError(f"Invalid head size for V3.2: {spec.head_size}")
     elif spec.model_version == "svf":
+        # TODO(zyj): re-compute the physical bytes on Ascend.
+        # we should have a scale dim here.
+        # we should have dtype of scale and k of indexer here.
         HEAD_DIM_TO_BLOCK_BYTES: dict[int, int] = {
             128: 132,  # SVF: 128B NoPE, 4B for fp32 scale = 132B
             512: 584,  # SVF: 448B NoPE, 128B RoPE, 8B for fp8 scale = 584B
@@ -292,6 +295,8 @@ def _init_mla_cache_fields(spec: MLAAttentionSpec | SlidingWindowMLASpec):
             raise ValueError(f"Invalid head size: {spec.head_size}.")
 
         if spec.alignment is not None:
+            # TODO(zyj): the alignment in A5 should be 128
+
             # Apply 576-byte alignment padding for SVF 512.
             # KV cache tensor is allocated with padded page_size,
             # but kernels access with shape [num_blocks, real_page_size].
@@ -313,6 +318,7 @@ class MLAAttentionSpec(FullAttentionSpec):
 
     def __post_init__(self):
         super().__post_init__()
+        # TODO(zyj): refactor me to the ascend layout
         _init_mla_cache_fields(self)
 
     @property
