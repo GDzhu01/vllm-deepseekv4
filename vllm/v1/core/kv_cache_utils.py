@@ -1310,7 +1310,7 @@ def group_and_unify_kv_cache_specs(
     ):
         return None
 
-    mla_specs: dict[str, KVCacheSpec] = {}
+    ratio_specs: dict[int, dict[str, KVCacheSpec]] = {}
     grouped_swa_mla_specs: dict[tuple[int, int], dict[str, KVCacheSpec]] = defaultdict(
         dict
     )
@@ -1318,10 +1318,11 @@ def group_and_unify_kv_cache_specs(
         if isinstance(spec, SlidingWindowMLASpec):
             grouped_swa_mla_specs[(spec.block_size, spec.sliding_window)][name] = spec
         elif isinstance(spec, MLAAttentionSpec):
-            mla_specs[name] = spec
-
-    assert len(mla_specs) > 0
-    mla_uniform_spec = UniformTypeKVCacheSpecs.from_specs(mla_specs)
+            ratio_specs[spec.compress_ratio][name] = spec
+    mla_uniform_specs = []
+    for compress_ratio, mla_specs in ratio_specs.items():
+        assert len(mla_specs) > 0
+        mla_uniform_specs.append(UniformTypeKVCacheSpecs.from_specs(mla_specs))
     assert mla_uniform_spec is not None
 
     swa_uniform_specs: list[UniformTypeKVCacheSpecs] = []
@@ -1329,8 +1330,7 @@ def group_and_unify_kv_cache_specs(
         uniform_spec = UniformTypeKVCacheSpecs.from_specs(spec_dict)
         assert uniform_spec is not None
         swa_uniform_specs.append(uniform_spec)
-
-    return [mla_uniform_spec, *swa_uniform_specs]
+    return [*mla_uniform_specs, *swa_uniform_specs]
 
 
 def approximate_gcd(values: Sequence[int], *, lower_bound: int | None = None) -> int:
