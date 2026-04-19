@@ -5,6 +5,7 @@ import copy
 from collections import Counter
 from dataclasses import dataclass, fields, replace
 from math import prod
+from typing import TYPE_CHECKING
 
 import torch
 from typing_extensions import Self
@@ -16,6 +17,7 @@ from vllm.utils.torch_utils import get_dtype_size
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
 
 
 logger = init_logger(__name__)
@@ -196,7 +198,7 @@ class FullAttentionSpec(AttentionSpec):
         )
 
 
-def _init_mla_cache_fields(spec: MLAAttentionSpec | SlidingWindowMLASpec):
+def _init_mla_cache_fields(spec):
     """Shared MLA cache init logic for quantiztion format across different models."""
     FP8_DTYPE = "fp8_ds_mla"
     MODEL_VERSIONS = ["v32", "svf"]
@@ -542,6 +544,7 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         if isinstance(one_spec, SlidingWindowMLASpec):
             # SlidingWindowMLASpec is uniform if all specs are SlidingWindowMLASpec
             # with the same sliding_window size.
+            # TODO(cmq): FIXME as we don't need the sliding window size must be equal in ascend
             return all(
                 isinstance(spec, SlidingWindowMLASpec)
                 and spec.sliding_window == one_spec.sliding_window

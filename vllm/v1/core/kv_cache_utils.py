@@ -1310,27 +1310,33 @@ def group_and_unify_kv_cache_specs(
     ):
         return None
 
-    ratio_specs: dict[int, dict[str, KVCacheSpec]] = {}
-    grouped_swa_mla_specs: dict[tuple[int, int], dict[str, KVCacheSpec]] = defaultdict(
+    ratio_specs: dict[int, dict[str, KVCacheSpec]] = defaultdict(dict)
+    grouped_swa_mla_specs: dict[int, dict[str, KVCacheSpec]] = defaultdict(
         dict
     )
     for name, spec in kv_cache_spec.items():
         if isinstance(spec, SlidingWindowMLASpec):
-            grouped_swa_mla_specs[(spec.block_size, spec.sliding_window)][name] = spec
+            grouped_swa_mla_specs[spec.block_size][name] = spec
         elif isinstance(spec, MLAAttentionSpec):
             ratio_specs[spec.compress_ratio][name] = spec
+
     mla_uniform_specs = []
-    for compress_ratio, mla_specs in ratio_specs.items():
-        assert len(mla_specs) > 0
-        mla_uniform_specs.append(UniformTypeKVCacheSpecs.from_specs(mla_specs))
-    assert mla_uniform_spec is not None
+    for spec_dict in ratio_specs.values():
+        assert len(spec_dict) > 0
+        mla_uniform_specs.append(UniformTypeKVCacheSpecs.from_specs(spec_dict))
+    assert mla_uniform_specs is not None
 
     swa_uniform_specs: list[UniformTypeKVCacheSpecs] = []
     for spec_dict in grouped_swa_mla_specs.values():
         uniform_spec = UniformTypeKVCacheSpecs.from_specs(spec_dict)
         assert uniform_spec is not None
         swa_uniform_specs.append(uniform_spec)
-    return [*mla_uniform_specs, *swa_uniform_specs]
+    # print(f"{mla_uniform_specs=}")
+    # print(f"{swa_uniform_specs=}")
+
+    return [*mla_uniform_specs, 
+            *swa_uniform_specs
+            ]
 
 
 def approximate_gcd(values: Sequence[int], *, lower_bound: int | None = None) -> int:
@@ -1380,6 +1386,8 @@ def _get_kv_cache_groups_uniform_groups(
     # For now, we restrict the first grouped_spec to be UniformTypeKVCacheSpecs
     # containing only MLAAttentionSpec.
     full_mla_spec = grouped_specs[0]
+    full_mla_c128_spec = grouped_specs[1]
+
     assert all(
         isinstance(spec, MLAAttentionSpec)
         for spec in full_mla_spec.kv_cache_specs.values()
@@ -1387,6 +1395,10 @@ def _get_kv_cache_groups_uniform_groups(
     full_mla_group = KVCacheGroupSpec(
         layer_names=list(full_mla_spec.kv_cache_specs.keys()),
         kv_cache_spec=full_mla_spec,
+    )
+    full_mla_c128_group = KVCacheGroupSpec(
+        layer_names=list(full_mla_c128_spec.kv_cache_specs.keys()),
+        kv_cache_spec=full_mla_c128_spec,
     )
 
     # We define a layer tuple as a group of layers with different page sizes, and
@@ -1404,12 +1416,13 @@ def _get_kv_cache_groups_uniform_groups(
     num_layer_tuples = approximate_gcd(
         num_layer_tuples_per_group, lower_bound=num_layer_tuples_per_group[0]
     )
-    # Round up to the nearest multiple of `num_layer_tuples` (i.e., padding)
-    num_layer_tuples_per_group = [
-        round_up(x, num_layer_tuples) for x in num_layer_tuples_per_group
-    ]
 
-    swa_mla_specs = grouped_specs[1:]
+
+    # TODO(cmq): this is not general enough
+    swa_mla_specs = grouped_specs[2:]
+    print(f"{swa_mla_specs=}")
+    print(f"{grouped_specs=}")
+
     assert all(
         isinstance(spec, SlidingWindowMLASpec)
         for group in swa_mla_specs
@@ -1468,7 +1481,7 @@ def _get_kv_cache_groups_uniform_groups(
                 )
             )
 
-    return [full_mla_group, *swa_mla_groups]
+    return [full_mla_group, full_mla_c128_group, *swa_mla_groups]
 
 
 def get_kv_cache_groups(
@@ -1497,13 +1510,13 @@ def get_kv_cache_groups(
         # most models. Allocate the same amount of memory for
         # each layer.
         return _get_kv_cache_groups_uniform_spec(kv_cache_spec)
+    elif grouped_specs := group_and_unify_kv_cache_specs(kv_cache_spec):
+        return _get_kv_cache_groups_uniform_groups(grouped_specs)
     elif uniform_spec := UniformTypeKVCacheSpecs.from_specs(kv_cache_spec):
         # All layers need the same number of token slots (e.g., all layers are
         # full attention, or all layers are sliding window attention with the
         # same window size). Put all layers into one group.
         return _get_kv_cache_groups_uniform_type(uniform_spec)
-    elif grouped_specs := group_and_unify_kv_cache_specs(kv_cache_spec):
-        return _get_kv_cache_groups_uniform_groups(grouped_specs)
 
     # As KVCacheManager can only allocate memory of one size, we need to unify
     # the page size of the layers. For cases cannot be unified, this function

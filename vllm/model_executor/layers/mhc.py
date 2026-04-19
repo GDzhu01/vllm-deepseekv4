@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
 
-import tilelang
-import tilelang.language as T
+# import tilelang
+# import tilelang.language as T
 import torch
 
 from vllm.utils.math_utils import cdiv
@@ -22,13 +22,13 @@ def compute_num_split(block_k: int, k: int | None, grid_size: int) -> int:
     return split_k
 
 
-@tilelang.jit(
-    pass_configs={
-        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-        tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
-    },
-)
+# @tilelang.jit(
+#     pass_configs={
+#         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+#         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+#         tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
+#     },
+# )
 def mhc_pre_big_fuse_tilelang(
     gemm_out_mul,
     gemm_out_sqrsum,
@@ -331,13 +331,13 @@ def _mhc_pre_fake(
     return post_mix, comb_mix, layer_input
 
 
-@tilelang.jit(
-    pass_configs={
-        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-        tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
-    },
-)
+# @tilelang.jit(
+#     pass_configs={
+#         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+#         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+#         tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
+#     },
+# )
 def mhc_post_tilelang(
     a,
     b,
@@ -348,7 +348,8 @@ def mhc_post_tilelang(
     hidden: int,
     n_thr: int = 128,
     h_blk: int = 1024,
-) -> tilelang.JITKernel:
+):
+# -> tilelang.JITKernel:
     # rename for shorter code
     n = T.dynamic("num_tokens")
     h = hidden
