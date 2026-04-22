@@ -1130,45 +1130,68 @@ def get_kv_cache_config_from_groups(
         # Here we allocate one KV cache tensor per (layer_tuple, page_size) "slot".
         # Layers across groups with the same page size at the same tuple index share
         # the same backing tensor.
-        full_mla_group = kv_cache_groups[0]
-        page_sizes_in_tuple = sorted(full_mla_group.kv_cache_spec.get_page_sizes())
-        layer_tuple_page_bytes = sum(page_sizes_in_tuple)
+        def get_real_layer_name(spec_layer_name: str):
+            return ".".join(spec_layer_name.split(".")[:3])
 
-        # Precompute per-group metadata once.
-        # - tuple_size: how many layers are in one "layer tuple" for this group
-        #              (equals the number of unique page sizes in the group).
-        # - layer_page_sizes: page_size per layer in the group's layer_names order.
-        group_meta: list[tuple[int, list[str], list[int]]] = []
-        num_layer_tuples = 0
+        layer_specs: dict[str, KVCacheSpec] = {}
+        page_kv_cache_groups = defaultdict(list)
         for group in kv_cache_groups:
-            assert isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
-            specs = group.kv_cache_spec.kv_cache_specs
-            tuple_size = len({spec.page_size_bytes for spec in specs.values()})
-            layer_names = group.layer_names
-            layer_page_sizes = [specs[name].page_size_bytes for name in layer_names]
-            group_meta.append((tuple_size, layer_names, layer_page_sizes))
-            num_layer_tuples = max(num_layer_tuples, cdiv(len(layer_names), tuple_size))
-        # Compute blocks using the final `num_layer_tuples` (important for correctness).
-        num_blocks = available_memory // (layer_tuple_page_bytes * num_layer_tuples)
-        num_blocks = may_override_num_blocks(vllm_config, num_blocks)
-
-        page_size_to_bucket = {ps: idx for idx, ps in enumerate(page_sizes_in_tuple)}
+            group_page_size_spec_layers = defaultdict(list)
+            for spec_layer_name in group.layer_names:
+                assert isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+                layer_single_spec = group.kv_cache_spec.kv_cache_specs[spec_layer_name]
+                group_page_size_spec_layers[layer_single_spec.page_size_bytes].append(spec_layer_name)
+                layer_specs[spec_layer_name] = layer_single_spec
+            for page_size, spec_layer_names in group_page_size_spec_layers.items():
+                # NOTE(zxr): we assume that layers with same page size in one group
+                # use same kv_cache_spec
+                page_group_spec = layer_specs[spec_layer_names[0]]
+                page_kv_cache_group = KVCacheGroupSpec(spec_layer_names, page_group_spec)
+                page_kv_cache_groups[page_size].append(page_kv_cache_group)
         kv_cache_tensors = []
-        for tuple_idx in range(num_layer_tuples):
-            shared_by_buckets: list[list[str]] = [[] for _ in page_sizes_in_tuple]
-            for tuple_size, layer_names, layer_page_sizes in group_meta:
-                start = tuple_idx * tuple_size
-                end = min(start + tuple_size, len(layer_names))
-                for layer_idx in range(start, end):
-                    ps = layer_page_sizes[layer_idx]
-                    bucket = page_size_to_bucket.get(ps)
-                    assert bucket is not None
-                    shared_by_buckets[bucket].append(layer_names[layer_idx])
-
-            for ps, shared_by in zip(page_sizes_in_tuple, shared_by_buckets):
+        max_group_size = 0
+        total_page_size = 0
+        for page_size, kv_cache_group_lists in page_kv_cache_groups.items():
+            page_group_size = max(len(g.layer_names) for g in kv_cache_group_lists)
+            max_group_size = max(max_group_size, page_group_size)
+            total_page_size += page_size
+        num_blocks = get_num_blocks(vllm_config, max_group_size, available_memory,
+                                        total_page_size)
+        for page_size, kv_cache_group_lists in page_kv_cache_groups.items():
+            page_group_size = max(len(g.layer_names) for g in kv_cache_group_lists)
+            allocate_complete_layers = []
+            used_layer_kv_cache_group_idx = defaultdict(set)
+            layer_kv_cache_group_idx = defaultdict(set)
+            layer_to_spec_layer_names = defaultdict(list)
+            for i, group in enumerate(kv_cache_group_lists):
+                for layer_name in group.layer_names:
+                    real_layer_name = get_real_layer_name(layer_name)
+                    layer_kv_cache_group_idx[real_layer_name].add(i)
+                    layer_to_spec_layer_names[real_layer_name].append(layer_name)
+            for i in range(page_group_size):
+                shared_by = []
+                used_group_idx_set = []
+                for j in range(len(kv_cache_group_lists)):
+                    for layer_name in kv_cache_group_lists[j].layer_names:
+                        real_layer_name = get_real_layer_name(layer_name)
+                        if real_layer_name in allocate_complete_layers:
+                            continue
+                        group_used = False
+                        for gid in layer_kv_cache_group_idx[real_layer_name]:
+                            if gid in used_group_idx_set:
+                                group_used = True
+                                break
+                            else:
+                                used_layer_kv_cache_group_idx[real_layer_name].add(gid)
+                        if group_used is True:
+                            continue
+                        shared_by.extend(layer_to_spec_layer_names[real_layer_name])
+                        used_group_idx_set.extend(layer_kv_cache_group_idx[real_layer_name])
+                        if len(used_layer_kv_cache_group_idx[real_layer_name]) == len(layer_kv_cache_group_idx[real_layer_name]):
+                            allocate_complete_layers.append(real_layer_name)
                 kv_cache_tensors.append(
-                    KVCacheTensor(size=ps * num_blocks, shared_by=shared_by)
-                )
+                    KVCacheTensor(size=page_size * num_blocks,
+                                  shared_by=shared_by))
     else:
         # General case:
         # We will have group_size memory pools, each is shared by one layer from
@@ -1331,8 +1354,6 @@ def group_and_unify_kv_cache_specs(
         uniform_spec = UniformTypeKVCacheSpecs.from_specs(spec_dict)
         assert uniform_spec is not None
         swa_uniform_specs.append(uniform_spec)
-    # print(f"{mla_uniform_specs=}")
-    # print(f"{swa_uniform_specs=}")
 
     return [*mla_uniform_specs, 
             *swa_uniform_specs
@@ -1420,8 +1441,6 @@ def _get_kv_cache_groups_uniform_groups(
 
     # TODO(cmq): this is not general enough
     swa_mla_specs = grouped_specs[2:]
-    print(f"{swa_mla_specs=}")
-    print(f"{grouped_specs=}")
 
     assert all(
         isinstance(spec, SlidingWindowMLASpec)
