@@ -1339,7 +1339,8 @@ def group_and_unify_kv_cache_specs(
             ratio_specs[spec.compress_ratio][name] = spec
 
     mla_uniform_specs = []
-    for spec_dict in ratio_specs.values():
+    for ratio in sorted(ratio_specs, key=lambda r: (r != 4, r)):
+        spec_dict = ratio_specs[ratio]
         assert len(spec_dict) > 0
         mla_uniform_specs.append(UniformTypeKVCacheSpecs.from_specs(spec_dict))
     assert mla_uniform_specs is not None
