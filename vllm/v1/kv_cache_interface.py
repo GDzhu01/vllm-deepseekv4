@@ -637,6 +637,8 @@ class KVCacheGroupSpec:
     layer_names: list[str]
     # The KV cache spec of this manager layer
     kv_cache_spec: KVCacheSpec
+    # Whether this group contains EAGLE/MTP draft attention layers.
+    is_eagle_group: bool = False
 
 
 @dataclass

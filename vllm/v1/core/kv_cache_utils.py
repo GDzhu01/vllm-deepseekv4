@@ -1550,15 +1550,15 @@ def get_kv_cache_groups(
         # most models. Allocate the same amount of memory for
         # each layer.
         return _get_kv_cache_groups_uniform_spec(kv_cache_spec)
-    elif grouped_specs := group_and_unify_kv_cache_specs(kv_cache_spec):
-        kv_cache_groups = _get_kv_cache_groups_uniform_groups(grouped_specs)
-        _annotate_eagle_groups_deepseek_v4(vllm_config, kv_cache_spec, kv_cache_groups)
-        return kv_cache_groups
     elif uniform_spec := UniformTypeKVCacheSpecs.from_specs(kv_cache_spec):
         # All layers need the same number of token slots (e.g., all layers are
         # full attention, or all layers are sliding window attention with the
         # same window size). Put all layers into one group.
         return _get_kv_cache_groups_uniform_type(uniform_spec)
+    elif grouped_specs := group_and_unify_kv_cache_specs(kv_cache_spec):
+        kv_cache_groups = _get_kv_cache_groups_uniform_groups(grouped_specs)
+        _annotate_eagle_groups_deepseek_v4(vllm_config, kv_cache_spec, kv_cache_groups)
+        return kv_cache_groups
 
     # As KVCacheManager can only allocate memory of one size, we need to unify
     # the page size of the layers. For cases cannot be unified, this function
@@ -1837,7 +1837,13 @@ def _project_kv_cache_groups_to_worker(
                     for layer_name in worker_layer_names
                 },
             )
-        projected_groups.append(KVCacheGroupSpec(worker_layer_names, group_spec))
+        projected_groups.append(
+            KVCacheGroupSpec(
+                worker_layer_names,
+                group_spec,
+                is_eagle_group=group.is_eagle_group and bool(worker_layer_names),
+            )
+        )
     return projected_groups
 
 
@@ -2021,10 +2027,7 @@ class BlockHashListWithBlockSize:
     def _get_value_at(self, idx: int) -> BlockHash:
         base = idx * self.scale_factor
         end = base + self.scale_factor
-        merged_hash: bytes = self.block_hashes[base]
-        for i in range(base + 1, end):
-            merged_hash += self.block_hashes[i]
-        return BlockHash(merged_hash)
+        return BlockHash(b"".join(self.block_hashes[base:end]))
 
 
 BlockHashList = list[BlockHash] | BlockHashListWithBlockSize
