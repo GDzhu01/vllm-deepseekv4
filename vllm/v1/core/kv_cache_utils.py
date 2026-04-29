@@ -1131,6 +1131,10 @@ def _get_kv_cache_config_deepseek_v4(
                 KVCacheTensor(size=ps * num_blocks, shared_by=shared_by)
             )
 
+    logger.info(100*"!")
+    logger.info(f"{kv_cache_groups=}")
+    logger.info(f"{kv_cache_tensors=}")
+
     return num_blocks, kv_cache_tensors
 
 
@@ -1498,6 +1502,7 @@ def _get_kv_cache_groups_uniform_groups(
                 )
             )
 
+    # TODO(cmq): PRINT ME!!!!!!!!!!!!
     return [full_mla_group, full_mla_c128_group, *swa_mla_groups]
 
 
