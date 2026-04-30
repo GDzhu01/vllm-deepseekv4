@@ -206,7 +206,7 @@ def _init_mla_cache_fields(spec):
         return
     assert spec.model_version in MODEL_VERSIONS, "Invalid model version."
     assert (spec.model_version == "v32" and spec.compress_ratio == 1) or (
-        spec.model_version == "svf" and spec.compress_ratio in [0, 4, 128]
+        spec.model_version == "svf" and spec.compress_ratio in [1, 4, 128]
     ), "Invalid compress ratio."
     if spec.compress_ratio > 1:
         assert spec.block_size % spec.compress_ratio == 0, (
@@ -227,16 +227,16 @@ def _init_mla_cache_fields(spec):
             raise ValueError(f"Invalid head size for V3.2: {spec.head_size}")
     elif spec.model_version == "svf":
         HEAD_DIM_TO_BLOCK_BYTES: dict[int, int] = {
-            128: 260,   # SVF: 128*2B NoPE, 4B for fp32 scale = 260B
-            512: 1024,  # SVF: 512*2B NoPE + RoPE = 1024B
+            128: 132,  # SVF: 128B NoPE, 4B for fp32 scale = 132B
+            512: 584,  # SVF: 448B NoPE, 128B RoPE, 8B for fp8 scale = 584B
         }
 
         if spec.head_size in HEAD_DIM_TO_BLOCK_BYTES:
             actual_head_bytes = HEAD_DIM_TO_BLOCK_BYTES[spec.head_size]
-        else:
-            actual_head_bytes = spec.head_size
-        object.__setattr__(spec, "head_size", actual_head_bytes)
-        object.__setattr__(spec, "head_size_v", actual_head_bytes)
+            object.__setattr__(spec, "head_size", actual_head_bytes)
+            object.__setattr__(spec, "head_size_v", actual_head_bytes)
+        elif spec.head_size not in HEAD_DIM_TO_BLOCK_BYTES.values():
+            raise ValueError(f"Invalid head size: {spec.head_size}.")
 
         if spec.alignment is not None:
             # Apply 576-byte alignment padding for SVF 512.

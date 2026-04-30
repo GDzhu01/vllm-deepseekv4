@@ -1084,81 +1084,52 @@ def _get_kv_cache_config_deepseek_v4(
 ) -> tuple[int, list[KVCacheTensor]]:
     """DeepseekV4 KV cache tensor layout planning.
 
-    DSV4-Pro has multiple independent KV cache groups (C4-MLA, C128-MLA, and
-    one or more SWA / compressor sub-groups). Each group owns its own block
-    table and allocates blocks independently from the shared BlockPool.
+    Precondition: kv_cache_groups[0] is the full-MLA group; its page sizes
+    define the canonical bucket set. Non-full-MLA groups must have been
+    page_size-padded upstream (see _get_kv_cache_groups_uniform_groups) so
+    every layer's page_size matches one of the full-MLA bucket sizes.
 
-    Sharing one physical tensor across groups (the previous SVF-style layout)
-    is unsafe here: with G independent block tables drawing from a single
-    BlockPool of `num_blocks`, the tensor backing a (tuple_idx, page_size)
-    slot may be written to by any group whose block table currently holds
-    that slot's block_id. The total number of distinct block_ids in flight
-    across all groups can exceed `num_blocks`, causing cross-group overwrite
-    of KV cache data and accuracy collapse (observed as garbled tokens).
-
-    Fix: allocate KV cache tensors *per group* (no cross-group sharing). Each
-    group reserves its own portion of available memory, sized exactly for
-    its own (num_layer_tuples_in_group * sum_of_page_sizes_in_group). This
-    matches the contract of HybridKVCacheCoordinator where every group owns
-    a private block table and a private backing buffer.
-
-    Within a group we still aggregate per-(tuple_idx, page_size) slots so
-    layers of the same model-layer index but different page sizes (e.g. the
-    C4 attention layer and its indexer KV) share a block table position,
-    which is required for correctness of the group manager.
+    For each group, bucket its layers by page_size_bytes and place each
+    layer at tuple_idx = position-within-bucket. Emit one KVCacheTensor
+    per (tuple_idx, bucket) whose shared_by is the union of per-group
+    layers at that slot.
     """
-    # Per-group bucketing by page_size; preserve registration order.
+    full_mla_spec = kv_cache_groups[0].kv_cache_spec
+    assert isinstance(full_mla_spec, UniformTypeKVCacheSpecs)
+    page_sizes = sorted(full_mla_spec.get_page_sizes())
+    layer_tuple_page_bytes = sum(page_sizes)
+
+    # Pre-bucket each group's layers by page_size (registration order within
+    # bucket). bucketed[g_idx][page_size] = [layer_name, ...].
     bucketed: list[dict[int, list[str]]] = []
-    group_page_sizes: list[list[int]] = []
-    group_num_tuples: list[int] = []
     for group in kv_cache_groups:
         assert isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
         specs = group.kv_cache_spec.kv_cache_specs
         b: dict[int, list[str]] = defaultdict(list)
         for name in group.layer_names:
-            # 每个 page size 对应的层名
             b[specs[name].page_size_bytes].append(name)
         bucketed.append(b)
-        group_page_sizes.append(sorted(b.keys()))
-        # Within a group, all per-page-size buckets must have the same
-        # length (this is enforced upstream in
-        # `_get_kv_cache_groups_uniform_groups`); use any bucket's length.
-        # 每个 page size 对应的层数的最大值
-        group_num_tuples.append(max(len(v) for v in b.values()))
 
-    # Memory weight per group = num_layer_tuples * sum(page_sizes_in_group).
-    # Distribute available_memory proportionally so that each group can
-    # accommodate exactly the same `num_blocks`. This guarantees that no
-    # group can ever require a block_id beyond what its tensors hold.
-    per_group_layer_tuple_bytes = [
-        sum(ps_list) for ps_list in group_page_sizes
-    ]
-    total_weight = sum(
-        nt * lb for nt, lb in zip(group_num_tuples, per_group_layer_tuple_bytes)
-    )
-    assert total_weight > 0, "DeepseekV4 KV cache groups have zero size"
+    # num_layer_tuples = longest bucket list across all groups. For the
+    # full-MLA group this equals the count of layers in the largest
+    # per-page-size bucket (= get_num_layer_tuples()); for SWA sub-groups
+    # this equals the sub-group size (each has a single page_size).
+    num_layer_tuples = max(len(layers) for b in bucketed for layers in b.values())
 
-    num_blocks = available_memory // total_weight
+    num_blocks = available_memory // (layer_tuple_page_bytes * num_layer_tuples)
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
 
     kv_cache_tensors: list[KVCacheTensor] = []
-    for g_idx, group in enumerate(kv_cache_groups):
-        b = bucketed[g_idx]
-        ps_list = group_page_sizes[g_idx]
-        nt = group_num_tuples[g_idx]
-        for tuple_idx in range(nt):
-            for ps in ps_list:
+    for tuple_idx in range(num_layer_tuples):
+        for ps in page_sizes:
+            shared_by: list[str] = []
+            for b in bucketed:
                 bucket = b.get(ps)
-                if bucket is None or tuple_idx >= len(bucket):
-                    continue
-                # Only layers within the SAME group share a tensor at the
-                # same (tuple_idx, page_size) slot. No cross-group sharing.
-                kv_cache_tensors.append(
-                    KVCacheTensor(
-                        size=ps * num_blocks,
-                        shared_by=[bucket[tuple_idx]],
-                    )
-                )
+                if bucket is not None and tuple_idx < len(bucket):
+                    shared_by.append(bucket[tuple_idx])
+            kv_cache_tensors.append(
+                KVCacheTensor(size=ps * num_blocks, shared_by=shared_by)
+            )
 
     return num_blocks, kv_cache_tensors
 
@@ -1700,18 +1671,20 @@ def _max_memory_usage_bytes_from_groups(
         # layer-tuple layout. Even groups with fewer actual tuples still reserve
         # the global number of tuple slots in the shared tensor layout.
         full_mla_spec = cast(UniformTypeKVCacheSpecs, kv_cache_groups[0].kv_cache_spec)
+        layer_tuple_bytes = sum(full_mla_spec.get_page_sizes())
+        num_layer_tuples = max(
+            cast(UniformTypeKVCacheSpecs, group.kv_cache_spec).get_num_layer_tuples()
+            for group in kv_cache_groups
+        )
 
         total_max_mem_usage_bytes = 0
         for group in kv_cache_groups:
             group_spec = cast(UniformTypeKVCacheSpecs, group.kv_cache_spec)
-            g_layer_tuple_bytes = sum(group_spec.get_page_sizes())
-            g_num_layer_tuples = group_spec.get_num_layer_tuples()
             g_max_mem_usage_pages = group_spec.max_memory_usage_pages(vllm_config)
-            total_max_mem_usage_bytes += (
-                g_num_layer_tuples
-                * g_max_mem_usage_pages
-                * g_layer_tuple_bytes
+            g_max_mem_usage_page_bytes = (
+                num_layer_tuples * g_max_mem_usage_pages * layer_tuple_bytes
             )
+            total_max_mem_usage_bytes += g_max_mem_usage_page_bytes
         return total_max_mem_usage_bytes
 
     # FIXME(yifan): How can code below work for Mamba and SWA?
