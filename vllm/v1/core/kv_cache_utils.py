@@ -1274,19 +1274,30 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
     if has_full_attention and (has_sliding_window or has_chunked_local_attention):
         for layer_name, spec in kv_cache_spec.items():
             if isinstance(spec, SlidingWindowMLASpec):
-                kv_cache_spec[layer_name] = MLAAttentionSpec(
+                from vllm.v1.kv_cache_interface import (
+                    MLAAttentionSpec as CurrentMLAAttentionSpec,
+                )
+
+                full_mla_spec = CurrentMLAAttentionSpec(
                     block_size=uniform_block_size
                     if uniform_block_size is not None
                     else spec.block_size,
                     num_kv_heads=spec.num_kv_heads,
                     head_size=spec.head_size,
                     dtype=spec.dtype,
-                    page_size_padded=spec.page_size_padded,
                     cache_dtype_str=spec.cache_dtype_str,
                     alignment=spec.alignment,
                     compress_ratio=spec.compress_ratio,
                     model_version=spec.model_version,
                 )
+                if (
+                    spec.page_size_padded is not None
+                    and spec.page_size_padded >= full_mla_spec.real_page_size_bytes
+                ):
+                    object.__setattr__(
+                        full_mla_spec, "page_size_padded", spec.page_size_padded
+                    )
+                kv_cache_spec[layer_name] = full_mla_spec
             elif isinstance(spec, SlidingWindowSpec):
                 kv_cache_spec[layer_name] = FullAttentionSpec(
                     block_size=spec.block_size,
@@ -1329,9 +1340,7 @@ def group_and_unify_kv_cache_specs(
         return None
 
     ratio_specs: dict[int, dict[str, KVCacheSpec]] = defaultdict(dict)
-    grouped_swa_mla_specs: dict[int, dict[str, KVCacheSpec]] = defaultdict(
-        dict
-    )
+    grouped_swa_mla_specs: dict[int, dict[str, KVCacheSpec]] = defaultdict(dict)
     for name, spec in kv_cache_spec.items():
         if isinstance(spec, SlidingWindowMLASpec):
             grouped_swa_mla_specs[spec.block_size][name] = spec
@@ -1351,9 +1360,7 @@ def group_and_unify_kv_cache_specs(
         assert uniform_spec is not None
         swa_uniform_specs.append(uniform_spec)
 
-    return [*mla_uniform_specs, 
-            *swa_uniform_specs
-            ]
+    return [*mla_uniform_specs, *swa_uniform_specs]
 
 
 def _approximate_gcd(values: Sequence[int], *, lower_bound: int | None = None) -> int:
@@ -1436,7 +1443,6 @@ def _get_kv_cache_groups_uniform_groups(
     num_layer_tuples_per_group = [
         round_up(x, num_layer_tuples) for x in num_layer_tuples_per_group
     ]
-
 
     # TODO(cmq): this is not general enough
     swa_mla_specs = grouped_specs[2:]
@@ -1523,6 +1529,7 @@ def _annotate_eagle_groups_deepseek_v4(
         if last_layer in group.layer_names:
             group.is_eagle_group = True
             break
+
 
 def get_kv_cache_groups(
     vllm_config: VllmConfig, kv_cache_spec: dict[str, KVCacheSpec]

@@ -9,7 +9,7 @@ import pytest
 import torch
 
 import vllm.v1.core.kv_cache_utils as kv_cache_utils
-from vllm.config import ModelConfig, SchedulerConfig, VllmConfig
+from vllm.config import DeviceConfig, ModelConfig, SchedulerConfig, VllmConfig
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
@@ -44,6 +44,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     KVCacheTensor,
     MLAAttentionSpec,
+    SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -1841,6 +1842,93 @@ def new_mla_spec(cache_dtype_str=None):
         dtype=torch.float32,
         cache_dtype_str=cache_dtype_str,
     )
+
+
+def new_svf_mla_spec(head_size=8, compress_ratio=4):
+    return MLAAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=head_size,
+        dtype=torch.float32,
+        compress_ratio=compress_ratio,
+        model_version="svf",
+    )
+
+
+def new_svf_swa_mla_spec(head_size=8, compress_ratio=4):
+    return SlidingWindowMLASpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=head_size,
+        dtype=torch.float32,
+        sliding_window=8,
+        compress_ratio=compress_ratio,
+        model_version="svf",
+    )
+
+
+@pytest.mark.skip_global_cleanup
+def test_deepseek_v4_uniform_groups_preserve_shared_kv_tensors():
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(max_model_len=16),
+        device_config=DeviceConfig("cpu"),
+    )
+    c4_specs = {
+        "layer.c4.small": new_svf_mla_spec(head_size=8, compress_ratio=4),
+        "layer.c4.large": new_svf_mla_spec(head_size=16, compress_ratio=4),
+    }
+    c128_specs = {
+        "layer.c128.small": new_svf_mla_spec(head_size=256, compress_ratio=128),
+    }
+    swa_specs = {
+        "layer.swa.small": new_svf_swa_mla_spec(head_size=8, compress_ratio=4),
+    }
+    grouped_specs = [
+        UniformTypeKVCacheSpecs.from_specs(c4_specs),
+        UniformTypeKVCacheSpecs.from_specs(c128_specs),
+        UniformTypeKVCacheSpecs.from_specs(swa_specs),
+    ]
+    assert all(spec is not None for spec in grouped_specs)
+    full_mla_spec = grouped_specs[0]
+    assert full_mla_spec is not None
+    layer_tuple_bytes = sum(full_mla_spec.get_page_sizes())
+    num_layer_tuples = max(
+        spec.get_num_layer_tuples() for spec in grouped_specs if spec is not None
+    )
+    kv_cache_groups = [
+        KVCacheGroupSpec(list(spec.kv_cache_specs), spec)
+        for spec in grouped_specs
+        if spec is not None
+    ]
+    expected_num_blocks = 7
+    available_memory = expected_num_blocks * num_layer_tuples * layer_tuple_bytes
+    expected_max_memory_usage = sum(
+        num_layer_tuples * spec.max_memory_usage_pages(vllm_config) * layer_tuple_bytes
+        for spec in grouped_specs
+        if spec is not None
+    )
+
+    kv_cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config, kv_cache_groups, available_memory
+    )
+
+    layer_specs = c4_specs | c128_specs | swa_specs
+    assert kv_cache_config.num_blocks == expected_num_blocks
+    assert (
+        kv_cache_utils._max_memory_usage_bytes_from_groups(vllm_config, kv_cache_groups)
+        == expected_max_memory_usage
+    )
+    assert sorted(
+        layer_name
+        for tensor in kv_cache_config.kv_cache_tensors
+        for layer_name in tensor.shared_by
+    ) == sorted(layer_specs)
+    assert any(len(tensor.shared_by) > 1 for tensor in kv_cache_config.kv_cache_tensors)
+    for tensor in kv_cache_config.kv_cache_tensors:
+        assert tensor.size in {
+            page_size * expected_num_blocks
+            for page_size in full_mla_spec.get_page_sizes()
+        }
 
 
 def test_merge_mla_spec():
